@@ -526,14 +526,35 @@ class PteRun(object):
         return None
 
 
-    def read(self, length=None, **kwargs) -> bytes:
-        """Returns:
+    def read(self, rel_off: int = None, length: int = None, **kwargs) -> bytes:
+        """
+        params:
+            rel_off: Start reading at the given relative offset.
+            length: Only read "length" bytes.
+
+        Returns:
             The page's content, described by this PteRun."""
+
+        if rel_off is None:
+            rel_off = 0
+
+        if rel_off >= self.length:
+            vollog.warning("Given relative offset is bigger than current page. "
+                           "Resetting to 0.")
+            rel_off = 0
+
+        if length is None:
+            length = self.length
+
+        if (rel_off + length) > self.length:
+            vollog.warning("Data to be read lies outside this page. Fixing...")
+            length = self.length - rel_off
+
         if not self.is_data_available and self.vaddr is not None:
             # We didn't find a corresponding physical/swap address, so we try a
             # last resort effort get some data via Volatility.
             try:
-                return self.proc_layer.read(self._vaddr,
+                return self.proc_layer.read(self._vaddr + rel_off,
                                             length,
                                             **kwargs)
             except:
@@ -549,11 +570,9 @@ class PteRun(object):
                                     "there is no support for this in Vol3.")
             return None
 
-        if length is None:
-            length = self._length
-
         offset = self._phys_offset if self._phys_offset is not None \
                      else self.swap_offset
+        offset += rel_off
         return self._data_layer.read(offset, length, **kwargs)
 
 
@@ -1957,6 +1976,12 @@ class PteEnumerator(object):
                                               offset = kvo)
         else:
             self.kernel = self.context.modules[self.config[kernel_layer_name]]
+        self.kernel_layer = self.context.layers[self.kernel.layer_name]
+
+        self.arch_os = self.kernel_layer.metadata.get("architecture")
+        if self.arch_os != "Intel64":
+            vollog.error("Unsupported architecture: {:s}".format(self.arch_os))
+            raise RuntimeError(f"Unsupported architecture: {self.arch_os:s}")
 
         vers = info.Info.get_version_structure(self.context,
                                                self.kernel.layer_name,
@@ -2043,7 +2068,6 @@ class PteEnumerator(object):
 
     def _init_variables(self):
         self.phys_layer = self.context.layers['memory_layer']
-        self.kernel_layer = self.context.layers[self.kernel.layer_name]
         self._swap_layer_count = \
             self.kernel_layer.config['swap_layers.number_of_elements']
         if self._swap_layer_count > 0:
@@ -2059,7 +2083,6 @@ class PteEnumerator(object):
             idx = -2 if temp[-2:].isdigit() else -1
             self._swap_layer_base_str = temp[:idx]
 
-        self.arch_os = self.kernel_layer.metadata.get("architecture")
         if self.arch_os == "Intel64":
             self.proto_vad_identifier = 0xffffffff0000
 
