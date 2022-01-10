@@ -105,7 +105,7 @@ state_to_mmpte = { 1: '_MMPTE_HARDWARE',
                    7: '_MMPTE_PROTOTYPE'
                  }
 
-# These are officially documented. Taken from 
+# These are not officially documented. Taken from 
 # https://reactos.org/wiki/Techwiki:Memory_management_in_the_Windows_XP_kernel
 mm_prot_enum = { 0: 'MM_ZERO_ACCESS',
                  1: 'MM_READONLY',
