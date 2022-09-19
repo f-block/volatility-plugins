@@ -544,6 +544,13 @@ class ApiSearch(interfaces.plugins.PluginInterface, PteMalfindInterface):
 
             vadlist.append((vad_start, vad_end, vad))
 
+        if not sections or not vadlist:
+            vollog.info("Seems like there are no sections to scan, for process "
+                        "{:d} {:s}. This process is probably already dead."
+                        .format(proc.UniqueProcessId,
+                                utility.array_to_string(proc.ImageFileName)))
+            return
+
         hits = list(proc_layer.scan(context=context, scanner=api_scanner, sections=sections))
 
         # Correlating hits with VADs. We are doing this to be able to start
