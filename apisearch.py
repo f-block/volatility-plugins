@@ -1,6 +1,6 @@
 #  This plugin helps identifying pointers to APIs (functions defined in loaded DLLs).
 #
-#    Copyright (c) 2021, Frank Block, <coding@f-block.org>
+#    Copyright (c) 2022, Frank Block, <coding@f-block.org>
 #
 #       All rights reserved.
 #
@@ -35,10 +35,11 @@ References:
 https://insinuator.net/2021/12/release-of-pte-analysis-plugins-for-volatility-3/
 """
 
-import logging, pefile
+import logging, pefile, codecs
 from tempfile import SpooledTemporaryFile
 from typing import Callable, List, Generator, Iterable, Type, Optional
 from volatility3.plugins.windows import dumpfiles, dlllist, pslist
+from volatility3.plugins.windows.ptenum import PteEnumerator
 from volatility3.plugins.windows.ptemalfind import PteMalfindInterface
 from volatility3.framework import renderers, interfaces, exceptions, constants
 from volatility3.framework.symbols import intermed
@@ -75,6 +76,20 @@ class ImportExportParser:
     """Offers functions to parse imports/exports of given DLLs."""
 
     @staticmethod
+    def get_formatted_import_export(export, dll_entry):
+        if isinstance(dll_entry, str):
+            mod_name = dll_entry
+        else:
+            try:
+                mod_name = dll_entry.BaseDllName.get_string()
+            except:
+                mod_name = hex(dll_entry.DllBase)
+        exp_name = (export.name or export.ordinal)
+        exp_name = "ordinal: {:d}".format(exp_name) if isinstance(exp_name, int) else exp_name.decode('utf-8')
+        return mod_name + '!' + exp_name
+
+
+    @staticmethod
     def open_method(filename):
         """Helper function to be able to use Vol3's dumping functions."""
         obj = SpooledTemporaryFile(mode='wb')
@@ -83,7 +98,7 @@ class ImportExportParser:
 
 
     # TODO finish implementation
-    # Currently not used;
+    # Currently not usable
     # Reimplementation of load_order_modules, that also supports WOW64 processes
     def load_order_modules(cls, proc) -> Iterable[interfaces.objects.ObjectInterface]:
         """Generator for DLLs in the order that they were loaded."""
@@ -96,13 +111,12 @@ class ImportExportParser:
                 yield entry
             if proc.get_is_wow64():
                 peb = proc.WoW64Process.Peb
-                print(peb)
         except exceptions.InvalidAddressException:
             return
 
 
     @staticmethod
-    def get_imports(file_handle, dll_entry):
+    def get_imports(file_handle, byte_index=True, wow64=False):
         """Parses the Imports of a given DLL, contained in file_handle.
 
         Returns:
@@ -110,7 +124,7 @@ class ImportExportParser:
             {api1_offset: [dll_entry, imp_obj], api2_offset: ...}
         """
         import_dict = dict()
-        if not file_handle or not dll_entry:
+        if not file_handle:
             return import_dict
 
         file_handle.seek(0)
@@ -119,10 +133,20 @@ class ImportExportParser:
         except:
             return import_dict
 
+        ptr_size = 8
+        if wow64:
+            ptr_size = 4
         try:
             for entry in pe_file.DIRECTORY_ENTRY_IMPORT:
+                dll_entry = codecs.decode(entry.dll, 'utf-8')
                 for imp in entry.imports:
-                    import_dict[imp.address.to_bytes(8, 'little')] = [dll_entry, imp]
+                    idx = imp.address
+                    if byte_index:
+                        try:
+                            idx = idx.to_bytes(ptr_size, 'little')
+                        except:
+                            continue
+                    import_dict[idx] = [dll_entry, imp]
         except AttributeError:
             pass
 
@@ -130,7 +154,7 @@ class ImportExportParser:
 
 
     @staticmethod
-    def get_exports(file_handle, dll_entry, img_base=None):
+    def get_exports(file_handle, dll_entry, img_base=None, byte_index=False, wow64=False):
         """Parses the Exports of a given DLL, contained in file_handle.
 
         Returns:
@@ -138,7 +162,7 @@ class ImportExportParser:
             {api1_offset: [dll_entry, exp_obj], api2_offset: ...}
         """
         export_dict = dict()
-        if not file_handle or not dll_entry:
+        if not file_handle:
             return export_dict
 
         file_handle.seek(0)
@@ -150,10 +174,19 @@ class ImportExportParser:
         if img_base is None:
             img_base = pe_file.OPTIONAL_HEADER.ImageBase
 
+        ptr_size = 8
+        if wow64:
+            ptr_size = 4
+
         try:
             for exp in pe_file.DIRECTORY_ENTRY_EXPORT.symbols:
-                # TODO support also 32 bit processes/addresses
-                export_dict[(img_base + exp.address).to_bytes(8, 'little')] = [dll_entry, exp]
+                idx = (img_base + exp.address)
+                if byte_index:
+                    try:
+                        idx = idx.to_bytes(ptr_size, 'little')
+                    except:
+                        continue
+                export_dict[idx] = [dll_entry, exp]
 
         except AttributeError:
             pass
@@ -170,6 +203,8 @@ class ImportExportParser:
         vad_start = vad.get_start()
 
         if not vad.has_member("Subsection"):
+            vollog.warning("Given VAD at 0x{:x}has no Subsection pointer."
+                           .format(vad.get_start()))
             return
 
         memory_layer = context.layers['memory_layer']
@@ -180,6 +215,7 @@ class ImportExportParser:
             return
 
         if not file_obj or not file_obj.is_valid():
+            vollog.warning("Failure while retrieving file object from VAD.")
             return
 
         for member_name, extension in [("DataSectionObject", "dat"), ("ImageSectionObject", "img")]:
@@ -199,7 +235,7 @@ class ImportExportParser:
 
 
     @classmethod
-    def get_exports_from_dumpfiles(cls, context, config, config_path, vad, dll_entry):
+    def get_exports_from_dumpfiles(cls, context, config, config_path, vad, dll_entry, byte_index=True, wow64=False):
         """Parses the DLL from the img/dat representations of the
         associated file, if available.
         
@@ -208,13 +244,13 @@ class ImportExportParser:
         export_dict = dict()
 
         for file_handle in cls._get_file_hnd_from_dumpfiles(context, config, config_path, vad):
-            export_dict.update(cls.get_exports(file_handle, dll_entry, img_base=vad.get_start()))
+            export_dict.update(cls.get_exports(file_handle, dll_entry, img_base=vad.get_start(), byte_index=byte_index, wow64=wow64))
 
         return export_dict
 
 
     @classmethod
-    def get_imports_from_dumpfiles(cls, context, config, config_path, vad, dll_entry):
+    def get_imports_from_dumpfiles(cls, context, config, config_path, vad, wow64=False):
         """Parses the DLL from the img/dat representations of the
         associated file, if available.
         
@@ -223,13 +259,13 @@ class ImportExportParser:
         import_dict = dict()
 
         for file_handle in cls._get_file_hnd_from_dumpfiles(context, config, config_path, vad, extensions=['img']):
-            import_dict.update(cls.get_imports(file_handle, dll_entry))
+            import_dict.update(cls.get_imports(file_handle, wow64=wow64))
 
         return import_dict
 
 
     @classmethod
-    def get_exports_from_file_objs_old(cls, context, config, config_path, vad, dll_entry):
+    def get_exports_from_file_objs_old(cls, context, config, config_path, vad, dll_entry, wow64=False):
         """Parses the DLL from the img/dat representations of the
         associated file, if available.
         
@@ -264,13 +300,13 @@ class ImportExportParser:
         for memory_object, layer, extension in dump_parameters:
             file_handle = dumpfiles.DumpFiles.dump_file_producer(file_obj, memory_object, cls.open_method, layer, '')
             if file_handle:
-                export_dict.update(cls.get_exports(file_handle, dll_entry, img_base=vad_start))
+                export_dict.update(cls.get_exports(file_handle, dll_entry, img_base=vad_start, byte_index=True, wow64=wow64))
 
         return export_dict
 
 
     @classmethod
-    def _get_file_hnd_from_vad(cls, context, config, config_path, dll_entry, proc_layer):
+    def _get_file_hnd_from_module(cls, context, config, config_path, dll_entry, proc_layer):
         """Returns:
             A file handle, containing the DLL's content."""
 
@@ -284,7 +320,7 @@ class ImportExportParser:
 
 
     @classmethod
-    def get_exports_from_vad(cls, context, config, config_path, vad, dll_entry, proc_layer):
+    def get_exports_from_module(cls, context, config, config_path, vad, dll_entry, proc_layer, byte_index=True, wow64=False):
         """Parses the DLL from the given VAD and returns the Exports. This
         function uses only the VAD's content itself, but not the
         img/vacb/dat representations of the associated file.
@@ -293,12 +329,12 @@ class ImportExportParser:
             See get_exports function."""
 
         # dump_pe from VAD (represented by an element of the InLoadOrderModuleList)
-        file_handle = cls._get_file_hnd_from_vad(context, config, config_path, dll_entry, proc_layer)
-        return cls.get_exports(file_handle, dll_entry, img_base=vad.get_start())
+        file_handle = cls._get_file_hnd_from_module(context, config, config_path, dll_entry, proc_layer)
+        return cls.get_exports(file_handle, dll_entry, img_base=vad.get_start(), byte_index=byte_index, wow64=wow64)
 
 
     @classmethod
-    def get_imports_from_vad(cls, context, config, config_path, vad, dll_entry, proc_layer):
+    def get_imports_from_module(cls, context, config, config_path, vad, dll_entry, proc_layer, byte_index=True, wow64=False):
         """Parses the DLL from the given VAD and returns the Exports. This
         function uses only the VAD's content itself, but not the
         img/vacb/dat representations of the associated file.
@@ -307,12 +343,12 @@ class ImportExportParser:
             See get_imports function."""
 
         # dump_pe from VAD (represented by an element of the InLoadOrderModuleList)
-        file_handle = cls._get_file_hnd_from_vad(context, config, config_path, dll_entry, proc_layer)
-        return cls.get_imports(file_handle, dll_entry)
+        file_handle = cls._get_file_hnd_from_module(context, config, config_path, dll_entry, proc_layer)
+        return cls.get_imports(file_handle, byte_index=byte_index, wow64=wow64)
 
 
     @classmethod
-    def get_exports_from_vad_old(cls, context, config, config_path, vad, dll_entry, proc_layer):
+    def get_exports_from_module_old(cls, context, config, config_path, vad, dll_entry, proc_layer, wow64=False):
         """Parses the DLL from the given VAD and returns the Exports. This
         function uses only the VAD's content itself, but not the
         img/vacb/dat representations of the associated file.
@@ -328,11 +364,11 @@ class ImportExportParser:
                                                                 "pe",
                                                                 class_types = pe.class_types)
         file_handle = dlllist.DllList.dump_pe(context, pe_table_name, dll_entry, cls.open_method, proc_layer)
-        return cls.get_exports(file_handle, dll_entry, img_base=vad_start)
+        return cls.get_exports(file_handle, dll_entry, img_base=vad_start, byte_index=True, wow64=wow64)
 
 
     @classmethod
-    def get_exports_from_dll(cls, context, config, config_path, vad, dll_entry, proc_layer):
+    def get_exports_from_dll(cls, context, config, config_path, vad, dll_entry, proc_layer, byte_index=True, wow64=False):
         """Parses the DLL from the given VAD and returns the Exports. This
         function not only uses the VAD's content itself, but also the
         img/vacb/dat representations of the associated file, if available, for
@@ -341,8 +377,9 @@ class ImportExportParser:
         Returns:
             See get_exports function."""
         export_dict = dict()
-        export_dict.update(cls.get_exports_from_dumpfiles(context, config, config_path, vad, dll_entry))
-        export_dict.update(cls.get_exports_from_vad(context, config, config_path, vad, dll_entry, proc_layer))
+        export_dict.update(cls.get_exports_from_dumpfiles(context, config, config_path, vad, dll_entry, byte_index=byte_index, wow64=wow64))
+        if dll_entry:
+            export_dict.update(cls.get_exports_from_module(context, config, config_path, vad, dll_entry, proc_layer, byte_index=byte_index, wow64=wow64))
         return export_dict
 
 
@@ -352,9 +389,6 @@ class ImportExportParser:
         
         Returns:
             See get_exports function."""
-        if not vadlist2:
-            vadlist2 = list(proc.get_vad_root().traverse())
-        vadlist=list()
         export_dict = dict()
         dll_offset_dict = dict()
         proc_layer_name = proc.add_process_layer()
@@ -362,27 +396,44 @@ class ImportExportParser:
         vads = list(proc.get_vad_root().traverse())
         if not vads:
             return export_dict
+        wow64 = proc.get_is_wow64()
         # TODO keep list of already parsed dumpfiles exports
         dll_entries = list(proc.load_order_modules())
-        for dll_entry in proc.load_order_modules():
+        for dll_entry in dll_entries:
             dll_offset_dict[dll_entry.DllBase] = dll_entry
         for i, vad in enumerate(vads):
             vad_start = vad.get_start()
-            vadlist.append((vad_start, vad.get_end(), vad))
-            if vad_start not in dll_offset_dict.keys():
-                continue
+            dll_entry = dll_offset_dict.get(vad_start, None)
+
             if progress_callback:
                 progress_callback(
                     (i/len(vads)) * 100,
                     "{:s}: Getting exports from DLLs for Process {:d}"
                     .format(cls.__name__, pid))
             # TODO use multithreading
-            export_dict.update(cls.get_exports_from_dll(context,
-                                                        config,
-                                                        config_path,
-                                                        vad,
-                                                        dll_offset_dict[vad_start],
-                                                        proc_layer_name))
+            if not dll_entry:
+                # little workaround as long as load_order_modules does not support
+                # 32 bit DLLs for WOW64 processes
+                if not PteEnumerator.vad_contains_image_file(vad):
+                    continue
+
+                dll_entry = vad.get_file_name()
+                if isinstance(dll_entry, str):
+                    dll_entry = dll_entry.rsplit('\\')[-1]
+                export_dict.update(cls.get_exports_from_dumpfiles(context,
+                                                                  config,
+                                                                  config_path,
+                                                                  vad,
+                                                                  dll_entry,
+                                                                  wow64=wow64))
+            else:
+                export_dict.update(cls.get_exports_from_dll(context,
+                                                            config,
+                                                            config_path,
+                                                            vad,
+                                                            dll_entry,
+                                                            proc_layer_name,
+                                                            wow64=wow64))
         return export_dict
 
 
@@ -393,6 +444,7 @@ class ApiScanner(ScannerInterface, PteMalfindInterface):
     their exports and searching for any pointers to the exported functions. 
 
     References:
+    https://insinuator.net/2021/12/release-of-pte-analysis-plugins-for-volatility-3/
     """
     thread_safe = True
 
@@ -410,7 +462,7 @@ class ApiScanner(ScannerInterface, PteMalfindInterface):
             yield (offset, self.export_dict[pattern])
 
 
-    def get_parsed_results(self, hits):
+    def get_parsed_results(self, hits, wow64=False):
         """Parses the search results"""
         if not hits or len(hits) <= 0:
             return None
@@ -418,20 +470,16 @@ class ApiScanner(ScannerInterface, PteMalfindInterface):
         last_offset = 0
         for offset, data in sorted(hits):
             dll_entry, export = data
-            try:
-                mod_name = dll_entry.BaseDllName.get_string()
-            except:
-                mod_name = hex(dll_entry.DllBase)
-            exp_name = (export.name or export.ordinal)
-            exp_name = "ordinal: {:d}".format(exp_name) if isinstance(exp_name, int) else exp_name.decode('utf-8')
-            exp_name = mod_name + '!' + exp_name
-            # TODO adjust when support for 32 bit is added
-            distance = 0 if last_offset == 0 else offset - last_offset - 8
+            exp_name = ImportExportParser.get_formatted_import_export(export, dll_entry)
+            ptr_size = 8
+            if wow64:
+                ptr_size = 4
+            distance = 0 if last_offset == 0 else offset - last_offset - ptr_size
             yield((offset, exp_name, distance))
             last_offset = offset
 
 
-    def get_formatted_results(self, hits, vad=None) -> Generator[str, None, None]:
+    def get_formatted_results(self, hits, vad=None, wow64=False) -> Generator[str, None, None]:
         """Generator for pretty-printable results."""
         if not hits:
             return
@@ -443,12 +491,12 @@ class ApiScanner(ScannerInterface, PteMalfindInterface):
         if vad:
             yield("Hits in VAD at 0x{:x}:".format(vad.get_start()))
             indent = "    "
-        for offset, exp_name, distance in self.get_parsed_results(hits):
+        for offset, exp_name, distance in self.get_parsed_results(hits, wow64=wow64):
             yield("0x{:x}: {:s}    distance: {:d}".format(offset, exp_name, distance))
 
 
-    def get_ptemalfind_results(self, hits, **kwargs) -> str:
-        return "\n".join(self.get_formatted_results(hits))
+    def get_ptemalfind_results(self, hits, wow64=False, **kwargs) -> str:
+        return "\n".join(self.get_formatted_results(hits, wow64=wow64))
 
 
 class ApiSearch(interfaces.plugins.PluginInterface, PteMalfindInterface):
@@ -457,6 +505,7 @@ class ApiSearch(interfaces.plugins.PluginInterface, PteMalfindInterface):
     their exports and searching for any pointers to the exported functions. 
 
     References:
+    https://insinuator.net/2021/12/release-of-pte-analysis-plugins-for-volatility-3/
     """
 
     _required_framework_version = (framework_version, 0, 0)
@@ -534,14 +583,18 @@ class ApiSearch(interfaces.plugins.PluginInterface, PteMalfindInterface):
         sections = list()
         for vad in proc.get_vad_root().traverse():
             vad_start = vad.get_start()
-            if not scan_dlls and vad_start in dll_offset_list:
-                continue
+            if not scan_dlls:
+                if vad_start in dll_offset_list:
+                    continue
+                # little workaround as long as load_order_modules does not support
+                # 32 bit DLLs for WOW64 processes
+                if PteEnumerator.vad_contains_image_file(vad):
+                    continue
             vad_end = vad.get_end()
             vad_size = vad_end - vad_start
             if vad_size > maxsize:
                 continue
             sections.append((vad_start, vad_size))
-
             vadlist.append((vad_start, vad_end, vad))
 
         if not sections or not vadlist:
@@ -589,9 +642,9 @@ class ApiSearch(interfaces.plugins.PluginInterface, PteMalfindInterface):
 
 
     @classmethod
-    def get_formatted_results(cls, api_scanner, hits) -> Generator[str, None, None]:
+    def get_formatted_results(cls, api_scanner, hits, wow64=False) -> Generator[str, None, None]:
         """Pretty-printed results with resolved export names."""
-        return api_scanner.get_formatted_results(hits)
+        return api_scanner.get_formatted_results(hits, wow64=wow64)
 
 
     @classmethod
@@ -599,7 +652,7 @@ class ApiSearch(interfaces.plugins.PluginInterface, PteMalfindInterface):
         """Pretty-printed results with resolved export names dedicated to be
         used from within the PteMalfind plugin."""
         api_scanner, hits = cls.get_results_for_sections(context, config, config_path, proc, sections, progress_callback=progress_callback)
-        return api_scanner.get_ptemalfind_results(hits)
+        return api_scanner.get_ptemalfind_results(hits, wow64=proc.get_is_wow64())
 
 
     def _generator(self, procs):
@@ -612,6 +665,7 @@ class ApiSearch(interfaces.plugins.PluginInterface, PteMalfindInterface):
         for i, proc in enumerate(processes):
             pid = proc.UniqueProcessId
             proc_name = utility.array_to_string(proc.ImageFileName)
+            wow64 = proc.get_is_wow64()
             if len_procs > 1: 
                 self._progress_callback(
                     (i/len_procs) * 100,
@@ -634,11 +688,11 @@ class ApiSearch(interfaces.plugins.PluginInterface, PteMalfindInterface):
                     return
 
                 api_scanner, hits = self.get_results_for_sections(self.context, self.config, self.config_path, proc, sections, progress_callback=progress_callback)
-                for offset, exp_name, distance in api_scanner.get_parsed_results(hits):
+                for offset, exp_name, distance in api_scanner.get_parsed_results(hits, wow64=wow64):
                     yield(0, (pid, proc_name, format_hints.Hex(vad_start), format_hints.Hex(offset), exp_name, distance))
 
             else:
                 api_scanner = ApiScanner(proc=proc, context=self.context, config=self.config, config_path=self.config_path, progress_callback=progress_callback)
                 for vad, hits in self.get_results_for_proc(self.context, self.config, self.config_path, proc, api_scanner, maxsize=self.config['maxsize'], scan_dlls=self.config['scan_dlls']):
-                    for offset, exp_name, distance in api_scanner.get_parsed_results(hits):
+                    for offset, exp_name, distance in api_scanner.get_parsed_results(hits, wow64=wow64):
                         yield(0, (pid, proc_name, format_hints.Hex(vad.get_start()), format_hints.Hex(offset), exp_name, distance))
