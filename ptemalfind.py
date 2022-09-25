@@ -1,6 +1,6 @@
 #  This plugin reveals all executable pages by examining PTEs
 #
-#    Copyright (c) 2021, Frank Block, <coding@f-block.org>
+#    Copyright (c) 2022, Frank Block, <coding@f-block.org>
 #
 #       All rights reserved.
 #
@@ -64,9 +64,7 @@ elif framework_version == 2:
     kernel_layer_name = 'kernel'
     kernel_reqs = [requirements.ModuleRequirement(name = kernel_layer_name,
                                                   description = 'Windows kernel',
-                                                  architectures = ["Intel32", "Intel64"]),
-                   requirements.SymbolTableRequirement(name = "nt_symbols",
-                                                       description = "Windows kernel symbols")]
+                                                  architectures = ["Intel32", "Intel64"])]
 else:
     # The highest major version we currently support is 2.
     raise RuntimeError(f"Framework interface version {framework_version} is "
@@ -107,7 +105,7 @@ class PteMalfind(interfaces.plugins.PluginInterface):
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
         return [*kernel_reqs,
                 requirements.BooleanRequirement(name = "dump",
-                                                description = "Dumps the hidden memory to files.",
+                                                description = "Dumps the executable memory regions to files.",
                                                 default = False,
                                                 optional = True),
                 requirements.PluginRequirement(name = 'pslist',
@@ -329,7 +327,9 @@ class PteMalfind(interfaces.plugins.PluginInterface):
                     x_data = None
                     if not config['dump_only_xpages'] and \
                             page.vaddr > offset:
-                        # We read everything up until the current exec page
+                        # The rest of the VADs content is not in our range
+                        # of executable pages, so we read everything else via
+                        # the process layer up until the current exec page.
                         while offset < min(memory_area_end, page.vaddr):
                             to_read = min(chunk_size, page.vaddr - offset)
                             nx_data = ptenum.proc_layer.read(offset,
