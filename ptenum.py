@@ -480,7 +480,7 @@ class PteRun(object):
 
         if self._ptenum_handle:
             struct_string = \
-                self._ptenum_handle.config["nt_symbols"] + \
+                self.ptenum_handle.symbol_table + \
                 constants.BANG + \
                 state_to_mmpte[self._state]
             return self._ptenum_handle.context.object(
@@ -1970,12 +1970,18 @@ class PteEnumerator(object):
         if framework_version == 1:
             layer_name = self.config[kernel_layer_name]
             kvo = self.context.layers[layer_name].config['kernel_virtual_offset']
+            self.symbol_table = self.config['nt_symbols']
 
-            self.kernel = self.context.module(self.config["nt_symbols"], 
+            self.kernel = self.context.module(self.symbol_table, 
                                               layer_name = layer_name,
                                               offset = kvo)
         else:
             self.kernel = self.context.modules[self.config[kernel_layer_name]]
+            if 'nt_symbols' in self.config:
+                self.symbol_table = self.config['nt_symbols']
+            else:
+                self.symbol_table = self.kernel.symbol_table_name
+
         self.kernel_layer = self.context.layers[self.kernel.layer_name]
 
         self.arch_os = self.kernel_layer.metadata.get("architecture")
@@ -1990,7 +1996,7 @@ class PteEnumerator(object):
 
         # Used for pretty-printing MMPTE structs
         for state in state_to_mmpte.values():
-            self.context.symbol_space[self.config['nt_symbols']].set_type_class(state, MMPTE)
+            self.context.symbol_space[self.symbol_table].set_type_class(state, MMPTE)
             # self.context.symbol_space[self.kernel.symbol_table_name].set_type_class(state, MMPTE)
         
         self._init_masks()
