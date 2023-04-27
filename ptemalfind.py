@@ -443,7 +443,11 @@ class PteMalfind(interfaces.plugins.PluginInterface):
 
             proc_result = dict()
             for vad, xpages in result.items():
-                vad_contains_imagefile = ptenum.vad_contains_image_file(vad)
+                if type(vad) == int:
+                    vad_contains_imagefile = False
+                else:
+                    vad_contains_imagefile = ptenum.vad_contains_image_file(vad)
+
                 if (vad_contains_imagefile and not \
                             (config.get('include_image_files') or
                              config.get('only_image_files'))) \
