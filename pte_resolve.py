@@ -1,40 +1,31 @@
 #  This module offers more or less the functionality of WinDbg's pte extension.
 #
-#    Copyright (c) 2021, Frank Block, <coding@f-block.org>
-#
-#       All rights reserved.
-#
-#       Redistribution and use in source and binary forms, with or without modification,
-#       are permitted provided that the following conditions are met:
-#
-#       * Redistributions of source code must retain the above copyright notice, this
-#         list of conditions and the following disclaimer.
-#       * Redistributions in binary form must reproduce the above copyright notice,
-#         this list of conditions and the following disclaimer in the documentation
-#         and/or other materials provided with the distribution.
-#       * The names of the contributors may not be used to endorse or promote products
-#         derived from this software without specific prior written permission.
-#
-#       THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-#       AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-#       IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-#       ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-#       LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-#       DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-#       SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-#       CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-#       OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-#       OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-"""This module offers more or less the functionality of WinDbg's pte extension.
-
-References:
-https://insinuator.net/2021/12/release-of-pte-analysis-plugins-for-volatility-3/
-"""
+# MIT License
+# 
+# Copyright (c) 2023 Frank Block, <research@f-block.org>
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 import logging
 from volatility3.framework import interfaces, renderers, constants, exceptions
 from volatility3.plugins.windows import pslist, ptenum
+from volatility3.plugins.windows.ptenum import SubsecProtoWrapper
 from volatility3.framework.objects import utility
 from volatility3.framework.configuration import requirements
 
@@ -53,9 +44,7 @@ elif framework_version == 2:
     kernel_layer_name = 'kernel'
     kernel_reqs = [requirements.ModuleRequirement(name = kernel_layer_name, 
                                                   description = 'Windows kernel',
-                                                  architectures = ["Intel32", "Intel64"]),
-                   requirements.SymbolTableRequirement(name = "nt_symbols",
-                                                       description = "Windows kernel symbols")]
+                                                  architectures = ["Intel32", "Intel64"])]
 else:
     # The highest major version we currently support is 2.
     raise RuntimeError(f"Framework interface version {framework_version} is "
@@ -94,6 +83,11 @@ class PteResolve(interfaces.plugins.PluginInterface, ptenum.PteEnumerator):
                 requirements.IntRequirement(name = 'pte_value',
                                             description = "A PTE value to parse",
                                             default = None,
+                                            optional = True),
+                requirements.BooleanRequirement(name = 'subsec_pte',
+                                            description = ("Tries to gather the SUBSECTION PTE for "
+                                                           "the given vaddr."),
+                                            default = False,
                                             optional = True)]
 
     def run(self):
@@ -123,7 +117,7 @@ class PteResolve(interfaces.plugins.PluginInterface, ptenum.PteEnumerator):
             self._initialize_internals()
             # In this case, we gather the associated process from the PTE's
             # physical address
-            pte_run = self.resolve_pte_by_paddr(self.config.get('pte_paddr'))
+            pte_run = self.resolve_pte_by_pte_paddr(self.config.get('pte_paddr'))
             if pte_run is None:
                 vollog.warning("Unable to resolve PTE.")
                 return
@@ -138,7 +132,7 @@ class PteResolve(interfaces.plugins.PluginInterface, ptenum.PteEnumerator):
 
         elif self.config.get('pte_value') is not None:
             self._initialize_internals()
-            pte_run = self.resolve_pte_by_value(self.config.get('pte_value'))
+            pte_run = self.resolve_pte_by_pte_value(self.config.get('pte_value'))
             if pte_run is None:
                 vollog.warning("Unable to resolve PTE.")
                 return
@@ -157,10 +151,18 @@ class PteResolve(interfaces.plugins.PluginInterface, ptenum.PteEnumerator):
                 self.init_for_proc(proc)
                 pte_run = None
                 if self.config.get('vaddr') is not None:
-                    pte_run = self.resolve_vaddr(self.config.get('vaddr'))
+                    if self.config.get('subsec_pte'):
+                        vaddr = self.config.get('vaddr')
+                        vad_start, vad_end, vad = self.get_vad_for_vaddr(vaddr)
+                        sub_wrp = SubsecProtoWrapper(vad, self._PAGE_BITS, self._PTE_SIZE)
+                        pte_vaddr = sub_wrp.get_pteaddr_for_vaddr(vad, vad_start, vad_end, vaddr)
+                        pte_run = self.resolve_pte_by_pte_vaddr(pte_vaddr, vaddr=vaddr, is_proto=True)
+
+                    else:
+                        pte_run = self.resolve_pte_by_vaddr(self.config.get('vaddr'))
 
                 elif self.config.get('pte_vaddr') is not None:
-                    pte_run = self.resolve_pte_by_vaddr(self.config.get('pte_vaddr'))
+                    pte_run = self.resolve_pte_by_pte_vaddr(self.config.get('pte_vaddr'))
 
                 if pte_run:
                     yield (0, (

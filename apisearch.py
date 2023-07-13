@@ -1,30 +1,26 @@
 #  This plugin helps identifying pointers to APIs (functions defined in loaded DLLs).
 #
-#    Copyright (c) 2022, Frank Block, <coding@f-block.org>
-#
-#       All rights reserved.
-#
-#       Redistribution and use in source and binary forms, with or without modification,
-#       are permitted provided that the following conditions are met:
-#
-#       * Redistributions of source code must retain the above copyright notice, this
-#         list of conditions and the following disclaimer.
-#       * Redistributions in binary form must reproduce the above copyright notice,
-#         this list of conditions and the following disclaimer in the documentation
-#         and/or other materials provided with the distribution.
-#       * The names of the contributors may not be used to endorse or promote products
-#         derived from this software without specific prior written permission.
-#
-#       THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-#       AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-#       IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-#       ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-#       LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-#       DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-#       SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-#       CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-#       OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-#       OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# MIT License
+# 
+# Copyright (c) 2023 Frank Block, <research@f-block.org>
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 
 """This plugin helps identifying pointers to APIs (functions defined in loaded
@@ -129,7 +125,7 @@ class ImportExportParser:
 
         file_handle.seek(0)
         try:
-            pe_file = pefile.PE(data=file_handle.read())
+            pe_file = pefile.PE(data=file_handle.read(), fast_load=True)
         except:
             return import_dict
 
@@ -154,7 +150,7 @@ class ImportExportParser:
 
 
     @staticmethod
-    def get_exports(file_handle, dll_entry, img_base=None, byte_index=False, wow64=False):
+    def get_exports(dll_entry, file_handle=None, pe_file=None, img_base=None, byte_index=False, wow64=False):
         """Parses the Exports of a given DLL, contained in file_handle.
 
         Returns:
@@ -162,14 +158,15 @@ class ImportExportParser:
             {api1_offset: [dll_entry, exp_obj], api2_offset: ...}
         """
         export_dict = dict()
-        if not file_handle:
+        if not file_handle and not pe_file:
             return export_dict
 
-        file_handle.seek(0)
-        try:
-            pe_file = pefile.PE(data=file_handle.read())
-        except:
-            return export_dict
+        if not pe_file:
+            file_handle.seek(0)
+            try:
+                pe_file = pefile.PE(data=file_handle.read(), fast_load=True)
+            except:
+                return export_dict
 
         if img_base is None:
             img_base = pe_file.OPTIONAL_HEADER.ImageBase
@@ -177,6 +174,11 @@ class ImportExportParser:
         ptr_size = 8
         if wow64:
             ptr_size = 4
+
+        try:
+            pe_file.DIRECTORY_ENTRY_EXPORT
+        except AttributeError:
+            pe_file.parse_data_directories()
 
         try:
             for exp in pe_file.DIRECTORY_ENTRY_EXPORT.symbols:
@@ -207,8 +209,6 @@ class ImportExportParser:
                            .format(vad.get_start()))
             return
 
-        memory_layer = context.layers['memory_layer']
-
         try:
             file_obj = vad.Subsection.ControlArea.FilePointer.dereference().cast("_FILE_OBJECT")
         except exceptions.InvalidAddressException:
@@ -218,6 +218,7 @@ class ImportExportParser:
             vollog.warning("Failure while retrieving file object from VAD.")
             return
 
+        memory_layer = context.layers['memory_layer']
         for member_name, extension in [("DataSectionObject", "dat"), ("ImageSectionObject", "img")]:
             if extension not in extensions:
                 continue
@@ -231,7 +232,7 @@ class ImportExportParser:
         for memory_object, layer, extension in dump_parameters:
             file_handle = dumpfiles.DumpFiles.dump_file_producer(file_obj, memory_object, cls.open_method, layer, '')
             if file_handle:
-                yield file_handle
+                yield memory_object, extension, file_handle
 
 
     @classmethod
@@ -243,8 +244,8 @@ class ImportExportParser:
             See get_exports function."""
         export_dict = dict()
 
-        for file_handle in cls._get_file_hnd_from_dumpfiles(context, config, config_path, vad):
-            export_dict.update(cls.get_exports(file_handle, dll_entry, img_base=vad.get_start(), byte_index=byte_index, wow64=wow64))
+        for _, _, file_handle in cls._get_file_hnd_from_dumpfiles(context, config, config_path, vad):
+            export_dict.update(cls.get_exports(dll_entry, file_handle=file_handle, img_base=vad.get_start(), byte_index=byte_index, wow64=wow64))
 
         return export_dict
 
@@ -258,7 +259,7 @@ class ImportExportParser:
             See get_imports function."""
         import_dict = dict()
 
-        for file_handle in cls._get_file_hnd_from_dumpfiles(context, config, config_path, vad, extensions=['img']):
+        for _, _, file_handle in cls._get_file_hnd_from_dumpfiles(context, config, config_path, vad, extensions=['img']):
             import_dict.update(cls.get_imports(file_handle, wow64=wow64))
 
         return import_dict
@@ -279,8 +280,6 @@ class ImportExportParser:
         if not vad.has_member("Subsection"):
             return export_dict
 
-        memory_layer = context.layers['memory_layer']
-
         try:
             file_obj = vad.Subsection.ControlArea.FilePointer.dereference().cast("_FILE_OBJECT")
         except exceptions.InvalidAddressException:
@@ -289,6 +288,7 @@ class ImportExportParser:
         if not file_obj or not file_obj.is_valid():
             return export_dict
 
+        memory_layer = context.layers['memory_layer']
         for member_name, extension in [("DataSectionObject", "dat"), ("ImageSectionObject", "img")]:
             try:
                 section_obj = getattr(file_obj.SectionObjectPointer, member_name)
@@ -300,7 +300,7 @@ class ImportExportParser:
         for memory_object, layer, extension in dump_parameters:
             file_handle = dumpfiles.DumpFiles.dump_file_producer(file_obj, memory_object, cls.open_method, layer, '')
             if file_handle:
-                export_dict.update(cls.get_exports(file_handle, dll_entry, img_base=vad_start, byte_index=True, wow64=wow64))
+                export_dict.update(cls.get_exports(dll_entry, file_handle=file_handle, img_base=vad_start, byte_index=True, wow64=wow64))
 
         return export_dict
 
@@ -330,7 +330,7 @@ class ImportExportParser:
 
         # dump_pe from VAD (represented by an element of the InLoadOrderModuleList)
         file_handle = cls._get_file_hnd_from_module(context, config, config_path, dll_entry, proc_layer)
-        return cls.get_exports(file_handle, dll_entry, img_base=vad.get_start(), byte_index=byte_index, wow64=wow64)
+        return cls.get_exports(dll_entry, file_handle=file_handle, img_base=vad.get_start(), byte_index=byte_index, wow64=wow64)
 
 
     @classmethod
@@ -364,7 +364,7 @@ class ImportExportParser:
                                                                 "pe",
                                                                 class_types = pe.class_types)
         file_handle = dlllist.DllList.dump_pe(context, pe_table_name, dll_entry, cls.open_method, proc_layer)
-        return cls.get_exports(file_handle, dll_entry, img_base=vad_start, byte_index=True, wow64=wow64)
+        return cls.get_exports(dll_entry, file_handle=file_handle, img_base=vad_start, byte_index=True, wow64=wow64)
 
 
     @classmethod

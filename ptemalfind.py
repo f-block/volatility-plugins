@@ -1,30 +1,26 @@
 #  This plugin reveals all executable pages by examining PTEs
 #
-#    Copyright (c) 2022, Frank Block, <coding@f-block.org>
-#
-#       All rights reserved.
-#
-#       Redistribution and use in source and binary forms, with or without modification,
-#       are permitted provided that the following conditions are met:
-#
-#       * Redistributions of source code must retain the above copyright notice, this
-#         list of conditions and the following disclaimer.
-#       * Redistributions in binary form must reproduce the above copyright notice,
-#         this list of conditions and the following disclaimer in the documentation
-#         and/or other materials provided with the distribution.
-#       * The names of the contributors may not be used to endorse or promote products
-#         derived from this software without specific prior written permission.
-#
-#       THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-#       AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-#       IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-#       ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-#       LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-#       DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-#       SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-#       CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-#       OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-#       OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# MIT License
+# 
+# Copyright (c) 2023 Frank Block, <research@f-block.org>
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 
 """This plugin enumerates and analyzes all PTEs for a given process and
@@ -173,6 +169,17 @@ class PteMalfind(interfaces.plugins.PluginInterface):
                                           filter_func = filter_func)))
 
 
+    @staticmethod
+    def get_vad_filename(vad):
+        try:
+            vad_name = vad.get_file_name()
+            if not isinstance(vad_name, str):
+                return "N/A"
+            return vad_name
+        except Exception:
+            return "N/A"
+
+
     @classmethod
     def get_page_result_for_render(
             cls,
@@ -245,9 +252,9 @@ class PteMalfind(interfaces.plugins.PluginInterface):
             if vad.get_private_memory() > 0:
                 mem_type_str = 'Private Memory'
             elif ptenum.vad_contains_image_file(vad):
-                mem_type_str = 'Mapped Image File: ' + vad.get_file_name()
+                mem_type_str = 'Mapped Image File: ' + cls.get_vad_filename(vad)
             elif ptenum.vad_contains_data_file(vad):
-                mem_type_str = 'Mapped Data File: ' + vad.get_file_name()
+                mem_type_str = 'Mapped Data File: ' + cls.get_vad_filename(vad)
             else:
                 mem_type_str = 'Mapped Memory'
 
@@ -400,7 +407,9 @@ class PteMalfind(interfaces.plugins.PluginInterface):
             procs: Generator[ObjectInterface, None, None],
             context: interfaces.context.ContextInterface,
             config: interfaces.configuration.HierarchicalDict,
-            progress_callback: Optional[constants.ProgressCallback]
+            progress_callback: Optional[constants.ProgressCallback],
+            start: int = None,
+            end: int = None
             ) -> Generator[Tuple[PteEnumerator,
                                  Dict[ObjectInterface, List[PteRun]] ],
                            None, None]:
@@ -414,6 +423,8 @@ class PteMalfind(interfaces.plugins.PluginInterface):
         # used for pages not belonging to any vad
         no_vad_counter = 0
 
+        start_v = start if isinstance(start, int) else config.get('start')
+        end_v = end if isinstance(end, int) else config.get('end')        
         # We are iterating PTEs for all processes and check them for being
         # executable.
         for proc, ptenum, pte_runs in \
@@ -422,14 +433,16 @@ class PteMalfind(interfaces.plugins.PluginInterface):
                     context,
                     config,
                     progress_callback=progress_callback,
-                    start=config.get('start'),
-                    end=config.get('end'),
+                    start=start_v,
+                    end=end_v,
                     nx_ret=True,
+                    subsec_ret=True,
                     zero_ret=True):
 
             result = {}
             for pte_run in pte_runs:
-                _, _, vad = pte_run.get_vad()
+                _, _, vad = ptenum.get_vad_for_vaddr(pte_run.vaddr,
+                                                     supress_warning=True)
                 if not vad:
                     # Each page not belonging to a vad is printed separately.
                     # We are using the no_vad_counter as an index for result.
@@ -450,7 +463,7 @@ class PteMalfind(interfaces.plugins.PluginInterface):
 
                 if (vad_contains_imagefile and not \
                             (config.get('include_image_files') or
-                             config.get('only_image_files'))) \
+                            config.get('only_image_files'))) \
                         or not vad_contains_imagefile and \
                             config.get('only_image_files'):
                     continue
@@ -458,8 +471,7 @@ class PteMalfind(interfaces.plugins.PluginInterface):
                 vad_should_be_printed = False
                 drop_these_pages = []
                 for pte_run in xpages:
-                    if vad_contains_imagefile and \
-                            (pte_run.is_proto or pte_run.has_proto_set):
+                    if vad_contains_imagefile and pte_run.orig_pte_is_sub_ptr:
                         # We skip unmodified pages for mapped image files
                         # (but still report unmodified executable pages for
                         # mapped data files as this is something suspicious

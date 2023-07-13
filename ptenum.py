@@ -1,30 +1,26 @@
 #  This module allows to enumerate and analyze all PTEs for a given process.
 #
-#    Copyright (c) 2021, Frank Block, <coding@f-block.org>
-#
-#       All rights reserved.
-#
-#       Redistribution and use in source and binary forms, with or without modification,
-#       are permitted provided that the following conditions are met:
-#
-#       * Redistributions of source code must retain the above copyright notice, this
-#         list of conditions and the following disclaimer.
-#       * Redistributions in binary form must reproduce the above copyright notice,
-#         this list of conditions and the following disclaimer in the documentation
-#         and/or other materials provided with the distribution.
-#       * The names of the contributors may not be used to endorse or promote products
-#         derived from this software without specific prior written permission.
-#
-#       THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-#       AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-#       IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-#       ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-#       LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-#       DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-#       SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-#       CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-#       OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-#       OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# MIT License
+# 
+# Copyright (c) 2023 Frank Block, <research@f-block.org>
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 # Some parts are taken from Rekall https://github.com/google/rekall
 # Code is marked accordingly.
@@ -61,6 +57,7 @@ https://insinuator.net/2021/12/release-of-pte-analysis-plugins-for-volatility-3/
 https://github.com/f-block/DFRWS-USA-2019
 https://dfrws.org/presentation/windows-memory-forensics-detecting-unintentionally-hidden-injected-code-by-examining-page-table-entries/
 """
+
 
 from __future__ import annotations
 
@@ -170,7 +167,7 @@ class MMPTE(StructType):
                 try:
                     dest = self.member(member).dereference()
                     type_name += " to " + hex(dest.vol.offset) + " (" + self._ssn(dest.vol.type_name) + ")"
-                except:
+                except Exception:
                    pass
             elif 'bitfield' in type_name:
                 bit_string = " (bits {:d}-{:d})".format(data[1].vol.start_bit,data[1].vol.end_bit)
@@ -192,9 +189,12 @@ class PteRun(object):
     # during initialization
     _PAGE_BITS = 16
     # For an explanation, see comment in PteEnumerator._init_variables
-    _APPLY_WEIRD_BIT_MASK = False
-    _WEIRD_BIT_MASK = ~(1 << (13 + _PAGE_BITS))
-
+    _SOFT_SWIZZLE_MASK = None
+    _INVALID_SWAP_OFFSET = None
+    _INVALID_SWAP_MASK = None
+    _TRANS_SWIZZLE_MASK = None
+    _INVALID_TRANS_OFFSET = None
+    _INVALID_TRANS_MASK = None
 
     # PteRun must be initialized either with an instance of PteEnumerator or
     # with a Volatility context
@@ -202,6 +202,7 @@ class PteRun(object):
                  proc, vaddr, length=None, phys_offset=None,
                  pte_value=None, pte_paddr=None, is_proto=None, state=None,
                  proto_ptr_run=None, is_exec=None, has_proto_set=None,
+                 orig_pte_value=None, orig_pte_is_sub_ptr=None,
                  is_proto_ptr=None, pid=None, pte_vaddr=None,
                  data_layer=None, pte_layer=None, swap_offset=None,
                  pagefile_idx=None):
@@ -224,6 +225,8 @@ class PteRun(object):
         # has_proto_set is set for MMU PTEs that have the Prototype flag set
         # in their MMPFN entry
         self._has_proto_set = has_proto_set
+        self._orig_pte_value = orig_pte_value
+        self._orig_pte_is_sub_ptr = orig_pte_is_sub_ptr
         # is_proto_ptr is set for MMU PTEs that either directly (PROTOPOINT)
         # or indirectly (PROTOVAD) point to a Prototype PTE
         self._is_proto_ptr = is_proto_ptr
@@ -258,13 +261,13 @@ class PteRun(object):
         if not self.proc:
             return None
 
-        if self._ptenum_handle:
+        if self.ptenum_handle:
             proc_offset = self.proc.vol.offset
-            if proc_offset in self._ptenum_handle._proc_layer_dict:
-                return self._ptenum_handle._proc_layer_dict[proc_offset]
+            if proc_offset in self.ptenum_handle._proc_layer_dict:
+                return self.ptenum_handle._proc_layer_dict[proc_offset]
             else:
                 layer_name = self.proc.add_process_layer()
-                return self._ptenum_handle.context.layers[layer_name]
+                return self.ptenum_handle.context.layers[layer_name]
 
         if self._context:
             layer_name = self.proc.add_process_layer()
@@ -294,6 +297,10 @@ class PteRun(object):
     @property
     def phys_offset(self) -> int:
         """The offset within the dumped RAM."""
+        if self._TRANS_SWIZZLE_MASK and self.state == 'TRANS' and \
+                not (self._TRANS_SWIZZLE_MASK & self.pte_value):
+            return self._phys_offset & self._INVALID_TRANS_MASK
+
         return self._phys_offset
 
     @property
@@ -303,11 +310,12 @@ class PteRun(object):
         if self._swap_offset is None:
             return None
 
-        if self._APPLY_WEIRD_BIT_MASK:
-            if self._swap_offset == 0x2000000:
+        if self._SOFT_SWIZZLE_MASK and \
+                not (self._SOFT_SWIZZLE_MASK & self.pte_value):
+            if self._swap_offset == self._INVALID_SWAP_OFFSET:
                 return None
             else:
-                return self._swap_offset & self._WEIRD_BIT_MASK
+                return self._swap_offset & self._INVALID_SWAP_MASK
 
         return self._swap_offset
 
@@ -351,19 +359,60 @@ class PteRun(object):
         if self._phys_offset is None:
             return None
         return self._phys_offset >> \
-            (self._ptenum_handle._PAGE_BITS if self._ptenum_handle else 12)
+            (self.ptenum_handle._PAGE_BITS if self.ptenum_handle else 12)
+
+
+    def _set_modified_characteristics(self):
+        # First we check if they have not been set already
+        if self._has_proto_set is not None and \
+                self._orig_pte_is_sub_ptr is not None and \
+                self._orig_pte_value is not None:
+            return
+        
+        if self.pfn is None or not self.ptenum_handle:
+            return
+
+        mod_chr_dict = \
+            self.ptenum_handle._get_modified_page_characteristics(self.pfn)
+        self._has_proto_set = mod_chr_dict['has_proto_set']
+        self._orig_pte_value = mod_chr_dict['orig_pte']
+        self._orig_pte_is_sub_ptr = mod_chr_dict['orig_pte_is_sub_ptr']
+
 
     @property
     def has_proto_set(self) -> bool:
         """has_proto_set is set for MMU PTEs that have the Prototype flag set
         in their MMPFN entry."""
 
-        if self._has_proto_set is None and self.pfn is not None \
-                and self._ptenum_handle:
-            self._has_proto_set = \
-                self._ptenum_handle._get_prototypepte_flag_for_pfn(self.pfn)
+        if self._has_proto_set is None:
+            self._set_modified_characteristics()
 
         return self._has_proto_set
+
+
+    @property
+    def orig_pte_value(self) -> int:
+        """Returns the OriginalPte value of the current page's MMPFN
+        entry."""
+        if self._orig_pte_value is None:
+            self._set_modified_characteristics()
+
+        # We currently need this value only for orig_pte_is_sub_ptr and also
+        # only if the PrototypePte flag is set, so this value is only in this
+        # case gathered and set through _set_modified_characteristics.
+        return self._orig_pte_value
+
+
+    @property
+    def orig_pte_is_sub_ptr(self) -> bool:
+        """Returns True if the OriginalPte state of the current page's MMPFN
+        entry is _MMPTE_SUBSECTION. This means for pages belonging to mapped
+        image files, that they are not yet modified."""
+        if self._orig_pte_is_sub_ptr is None:
+            self._set_modified_characteristics()
+
+        return self._orig_pte_is_sub_ptr
+
 
     @property
     def is_proto_ptr(self) -> bool:
@@ -398,7 +447,7 @@ class PteRun(object):
     def state(self) -> str:
         """Returns:
             The PTE's state as string, according to state_enum_rev."""
-        return state_enum_rev[self._state] if self._state else None
+        return state_enum_rev[self._state] if self._state else 'Undetermined'
 
     @property
     def pte_vaddr(self) -> int:
@@ -410,7 +459,7 @@ class PteRun(object):
         if self._pte_vaddr:
             return self._pte_vaddr
         
-        if not self._ptenum_handle:
+        if not self.ptenum_handle:
             vollog.warning("Without ptenum context, resolving the PTE's "
                            "virtual address is currently not supported.")
             return self._pte_vaddr
@@ -418,7 +467,7 @@ class PteRun(object):
         if self._pte_paddr is None:
             return self._pte_vaddr
 
-        _, pte_vaddr = self._ptenum_handle.ptov(self._pte_paddr)
+        _, pte_vaddr = self.ptenum_handle.ptov(self._pte_paddr)
         self._pte_vaddr = pte_vaddr
         return self._pte_vaddr
 
@@ -429,7 +478,8 @@ class PteRun(object):
         # The prototype PTE can have a different protection value than the
         # mapped view in a process, so we first check for the protection of the
         # proto-pointer, as this protection supersedes the one of the prototype PTE.
-        if self._is_proto and self._proto_ptr_run._is_exec is not None:
+        if self.is_proto and self._proto_ptr_run and \
+                self._proto_ptr_run._is_exec is not None:
             return self._proto_ptr_run._is_exec
         
         return self._is_exec
@@ -452,8 +502,26 @@ class PteRun(object):
     @property
     def is_mapped(self) -> bool:
         """Returns:
-            True if """
+            True if the page's state is HARDWARE or TRANSITION,
+            otherwise False."""
         return self._state in [1, 2]
+
+
+    @cached_property
+    def is_unmodified_img_page(self) -> bool:
+        """Returns:
+            True if this page belongs to an image file and this page is yet
+            not modified.
+            False otherwise.
+            It returns None if the page does not belong to an image file.
+        """
+        try:
+            if PteEnumerator.vad_contains_image_file(self.get_vad()[2]):
+                return self.orig_pte_is_sub_ptr
+        except:
+            pass
+        return None
+    
 
     @cached_property
     def is_empty(self) -> bool:
@@ -466,8 +534,8 @@ class PteRun(object):
         if not self.is_data_available:
             return None
         
-        if self._length <= 0x1000 and self._ptenum_handle:
-            return self.read() == self._ptenum_handle._ALL_ZERO_PAGE
+        if self._length <= 0x1000 and self.ptenum_handle:
+            return self.read() == self.ptenum_handle._ALL_ZERO_PAGE
         else:
             return self.read() == b"\x00" * self._length
 
@@ -478,12 +546,12 @@ class PteRun(object):
         if not (self._pte_paddr is not None and self._state and self._pte_layer):
             return None
 
-        if self._ptenum_handle:
+        if self.ptenum_handle:
             struct_string = \
                 self.ptenum_handle.symbol_table + \
                 constants.BANG + \
                 state_to_mmpte[self._state]
-            return self._ptenum_handle.context.object(
+            return self.ptenum_handle.context.object(
                 struct_string,
                 offset = self._pte_paddr,
                 layer_name = self.pte_layer.name)
@@ -496,7 +564,7 @@ class PteRun(object):
         """Returns:
             The MMPFN entry for this PteRun if it has an associated physical
             page."""
-        if not self._phys_offset:
+        if self._phys_offset is None:
             return None
         
         if self.ptenum_handle:
@@ -507,12 +575,13 @@ class PteRun(object):
             return None
 
 
+    @lru_cache(maxsize=64)
     def get_vad(self) -> Tuple[int, int, ObjectInterface]:
         """Returns:
             The VAD associated with this PteRun instance in a tuple:
             (vad_start, vad_end, MMVAD)"""
         if self.vaddr is None:
-            return None
+            return (None, None, None)
 
         if self.ptenum_handle:
             return self.ptenum_handle.get_vad_for_vaddr(self.vaddr, self.proc)
@@ -523,21 +592,27 @@ class PteRun(object):
                 vad_end = vad.get_end()
                 if vad_start <= self.vaddr <= vad_end:
                     return (vad_start, vad_end, vad)
+        return (None, None, None)
+
+
+    def get_iso_pte(self) -> PteRun:
+        if self.ptenum_handle:
+            return self.ptenum_handle.resolve_iso_pte_by_vaddr(self.vaddr)
         return None
 
 
     def read(self, rel_off: int = None, length: int = None, **kwargs) -> bytes:
         """
         params:
-            rel_off: Start reading at the given relative offset.
+            rel_off: Start reading at the given relative offset. 
             length: Only read "length" bytes.
-
+            
         Returns:
             The page's content, described by this PteRun."""
-
+        
         if rel_off is None:
             rel_off = 0
-
+        
         if rel_off >= self.length:
             vollog.warning("Given relative offset is bigger than current page. "
                            "Resetting to 0.")
@@ -547,17 +622,18 @@ class PteRun(object):
             length = self.length
 
         if (rel_off + length) > self.length:
-            vollog.warning("Data to be read lies outside this page. Fixing...")
+            vollog.debug("Data to be read lies outside this page: "
+                           f"rel_off: {rel_off:d} length: {length:d}. Fixing...")
             length = self.length - rel_off
 
         if not self.is_data_available and self.vaddr is not None:
             # We didn't find a corresponding physical/swap address, so we try a
-            # last resort effort get some data via Volatility.
+            # last resort effort to get some data via Volatility.
             try:
                 return self.proc_layer.read(self._vaddr + rel_off,
                                             length,
                                             **kwargs)
-            except:
+            except Exception:
                 vollog.warning("No data found for Process {:d} at vaddr: "
                                 "0x{:x}.".format(self.pid, self._vaddr))
                 # For swapped pages, idx 0 is typically the first pagefile,
@@ -567,13 +643,19 @@ class PteRun(object):
                 if self._pagefile_idx == 2:
                     vollog.warning("The page is most likely contained "
                                     "within compressed memory. Currently, "
-                                    "there is no support for this in Vol3.")
+                                    "there is no support for this in "
+                                    "Volatility3.")
             return None
 
         offset = self._phys_offset if self._phys_offset is not None \
-                     else self.swap_offset
+                                   else self.swap_offset
         offset += rel_off
-        return self._data_layer.read(offset, length, **kwargs)
+        try:
+            return self._data_layer.read(offset, length, **kwargs)
+        except Exception:
+            vollog.warning("Failed to retrieve data for Process {:d} at "
+                           "vaddr: 0x{:x}.".format(self.pid, self._vaddr))
+            return b''
 
 
     def __repr__(self) -> str:
@@ -585,7 +667,7 @@ class PteRun(object):
             result += "swap_offset: " + ("0x{:x}".format(self.swap_offset) if self.swap_offset is not None else "None") + "\n"
             result += "pagefile_idx: " + ("{:d}".format(self.pagefile_idx) if self.pagefile_idx is not None else "None") + "\n"
         else:
-            result += "phys_offset: " + ("0x{:x}".format(self._phys_offset) if self._phys_offset is not None else "None") + "\n"
+            result += "phys_offset: " + ("0x{:x}".format(self.phys_offset) if self.phys_offset is not None else "None") + "\n"
         result += "length: " + ("0x{:x}".format(self._length) if self._length else "None") + "\n"
         result += "pte_value: " + ("0x{:x}".format(self._pte_value) if isinstance(self._pte_value, int) else "None") + "\n"
         result += "pte_paddr: " + ("0x{:x}".format(self._pte_paddr) if isinstance(self._pte_paddr, int) else "None") + "\n"
@@ -593,12 +675,14 @@ class PteRun(object):
         result += "is_proto: {0}".format("Undetermined" if self._is_proto is None else self._is_proto) + "\n"
         result += "is_proto_ptr: {0}".format("Undetermined" if self._is_proto_ptr is None else self._is_proto_ptr) + "\n"
         result += "has_proto_set: {0}".format("Undetermined" if self.has_proto_set is None else self.has_proto_set) + "\n"
-        result += "state: {0}".format(state_enum_rev[self._state] if self._state else "Undetermined") + "\n"
+        result += "orig_pte_value: {0}".format("Undetermined" if self.orig_pte_value is None else "0x{:x}".format(self.orig_pte_value)) + "\n"
+        result += "orig_pte_is_sub_ptr: {0}".format("Undetermined" if self.orig_pte_is_sub_ptr is None else self.orig_pte_is_sub_ptr) + "\n"
+        result += "state: {0}".format(self.state) + "\n"
         result += "is_exec: {0}".format("Undetermined" if self._is_exec is None else self._is_exec) + "\n"
-        if self._is_proto:
+        if self.is_proto and self._proto_ptr_run:
             result += "Page is for this process executable: {0}".format(self.is_executable) + "\n"
             result += "\nProtopointer (the actual MMU PTE):\n"
-            result += textwrap.indent(repr(self._proto_ptr_run), '    ')
+            result += textwrap.indent(repr(self.proto_ptr_run), '    ')
         return result
 
 
@@ -615,7 +699,7 @@ class PteRun(object):
             result += "MMPTE struct:\n"
             result += "=============\n"
             result += repr(self.get_mmpte())
-            if self.is_proto:
+            if self.is_proto and self._proto_ptr_run:
                 proto_mmpte = self.proto_ptr_run.get_mmpte()
                 if proto_mmpte:
                     result += "\nCorresponding ProtoPointer:\n"
@@ -691,7 +775,9 @@ class SubsecProtoWrapper(object):
         # As there might be subviews and hence, our PTE may not be referenced
         # by the contiguous pointers, we have to calculate the offset for those
         # cases.
-        pointer_diff = old_div((vad.FirstPrototypePte - self.index_list[0][2].SubsectionBase), self._PTE_SIZE)
+        pointer_diff = old_div(
+            (vad.FirstPrototypePte - self.index_list[0][2].SubsectionBase),
+            self._PTE_SIZE)
         idx += pointer_diff
         if self.range[0] <= idx <= self.range[1]:
             for base_idx, end, subsec in self.index_list:
@@ -731,6 +817,34 @@ class SubsecProtoWrapper(object):
                        "for a growing file.".format(idx, last_idx, vaddr))
         return None
 
+
+    def get_all_subsec_pteaddr(self) -> Generator[int]:
+        """Returns every PTE address for each subsection in the list."""
+        if not self.range:
+            self._init_subsec()
+
+        for base_idx, last_idx, subsec in self.index_list:
+            subsec_base = subsec.SubsectionBase
+            pte_count = last_idx - base_idx + 1
+            for idx in range(0, pte_count, 1):
+                yield subsec_base + (idx * self._PTE_SIZE)
+
+        # curr_idx is only been kept for index_list resp. get_pteaddr_for_vaddr
+        curr_idx = last_idx + 1
+        subsec = subsec.NextSubsection
+        while subsec != 0:
+            subsec = subsec.dereference()
+            pte_count = subsec.PtesInSubsection
+            subsec_base = subsec.SubsectionBase
+            last_idx = curr_idx + pte_count - 1
+            self.index_list.append((curr_idx, last_idx, subsec))
+            self.range[1] = last_idx
+            for idx in range(0, pte_count, 1):
+                yield subsec_base + (idx * self._PTE_SIZE)
+            curr_idx += pte_count
+            subsec = subsec.NextSubsection
+
+
 # We support versions 1 and 2
 framework_version = constants.VERSION_MAJOR
 if framework_version == 1:
@@ -755,7 +869,7 @@ class PteEnumerator(object):
     _resolved_dtbs = dict()
     _vad_dict = dict()
     _proc_layer_dict = dict()
-
+    _protect_values = None
 
     def __init__(self, *args, **kwargs):
         self.dtb = None
@@ -763,6 +877,7 @@ class PteEnumerator(object):
         self.phys_layer = None
         self._swap_layer_count = None
         self._swap_layer_base_str = None
+        self._invalid_pte_mask = None
         self._valid_mask = 1
         self.arch_os = None
         self.arch_proc = None
@@ -770,6 +885,8 @@ class PteEnumerator(object):
         self._PAGE_BITS = None
         self.kernel = None
         self.proc = None
+        self.pid = None
+        self.is_wow64 = None
         # Reference to the vadlist for the current process.
         # In essence a pointer into _vad_dict.
         self._proc_vads = list()
@@ -797,7 +914,6 @@ class PteEnumerator(object):
 
     # static implementation of get_protection from class MMVAD_SHORT
     @staticmethod
-    @lru_cache(maxsize=128)
     def _get_protection(protect, protect_values, winnt_protections):
         """Get the VAD's protection constants as a string."""
         try:
@@ -813,7 +929,7 @@ class PteEnumerator(object):
         return "|".join(names)
 
 
-    @lru_cache(maxsize=128)
+    @lru_cache(maxsize=32)
     def _get_subsec_protection(self, protect):
         if not self._protect_values:
              self._protect_values = vadinfo.VadInfo.protect_values(context = self.context,
@@ -878,6 +994,10 @@ class PteEnumerator(object):
 
     @staticmethod
     def _get_vad_type(vad: ObjectInterface) -> int:
+        # this case happens for PTEs not belonging to any VAD (orphaned pages)
+        if isinstance(vad, int):
+            return -1
+
         if vad.has_member("u1") and vad.u1.has_member("VadFlags1") and vad.u1.VadFlags1.has_member("VadType"):
             return vad.u1.VadFlags1.VadType
 
@@ -900,6 +1020,8 @@ class PteEnumerator(object):
     def vad_contains_image_file(cls, vad: ObjectInterface) -> bool:
         """Returns:
             True if the given VAD belongs to a mapped PE file."""
+        if vad is None:
+            return None
         return cls._get_vad_type(vad) == 2
 
 
@@ -966,7 +1088,7 @@ class PteEnumerator(object):
 
                 # TODO paged out paging structures have valid bit unset,
                 # but if the pagefile is supplied, we still could read it.
-                if not pdpte_value & self._valid_mask:
+                if pdpte_value is None or not pdpte_value & self._valid_mask:
                     continue
 
                 yield [vaddr, pdpte_value, pdpte_addr]
@@ -985,7 +1107,12 @@ class PteEnumerator(object):
         if pde_table_addr is None:
             return
 
-        data = self.phys_layer.read(pde_table_addr, 8 * 0x200)
+        try:
+            data = self.phys_layer.read(pde_table_addr, 8 * 0x200)
+        except Exception:
+            vollog.warning("Failure reading PDEs from PDE table address: "
+                           "0x{:x}".format(pde_table_addr))
+            return
         pde_table = struct.unpack("<" + "Q" * 0x200, data)
 
         tmp2 = vaddr
@@ -1029,7 +1156,13 @@ class PteEnumerator(object):
         # windows where IO is extremely expensive, its
         # about 10 times more efficient than reading it
         # one value at the time - and this loop is HOT!
-        data = self.phys_layer.read(pte_table_addr, self._PTE_SIZE * 0x200)
+        try:
+            data = self.phys_layer.read(pte_table_addr, self._PTE_SIZE * 0x200)
+        except Exception:
+            vollog.warning("Failure reading PTEs from PTE table address: "
+                           "0x{:x}".format(pte_table_addr))
+            return
+
         pte_table = struct.unpack("<" + "Q" * 0x200, data)
 
         tmp = vaddr
@@ -1040,9 +1173,7 @@ class PteEnumerator(object):
             vaddr = tmp | pfn
             if vaddr > end:
                 return
-
-            next_vaddr = tmp | ((i + 1) << 12)
-            if start >= next_vaddr:
+            if start > vaddr:
                 continue
 
             yield [vaddr, pte_value, pte_table_addr + i*8]
@@ -1053,6 +1184,7 @@ class PteEnumerator(object):
                        start: int = 0,
                        end: int = None,
                        nx_ret: bool = False,
+                       subsec_ret: bool = False,
                        zero_ret: bool = True) -> Generator[PteRun]:
         """Enumerates all Paging structures and returns a PteRun object for 
         each identified PTE.
@@ -1108,6 +1240,8 @@ class PteEnumerator(object):
                 if pde_value & self._valid_mask and \
                         pde_value & self._page_size_mask:
                     # large page
+                    vollog.debug("Found large page at 0x{:x}".format(pde_vaddr))
+
                     executable = False
                     if not pde_value & self._nx_mask:
                         executable = True
@@ -1138,6 +1272,7 @@ class PteEnumerator(object):
                                            pte_value,
                                            pte_addr,
                                            nx_ret=nx_ret,
+                                           subsec_ret=subsec_ret,
                                            zero_ret=zero_ret)
                     if run:
                         yield run
@@ -1153,6 +1288,7 @@ class PteEnumerator(object):
             start: int = 0,
             end: int = None,
             nx_ret: bool = False,
+            subsec_ret: bool = False,
             zero_ret: bool = True) -> Generator[Tuple[ObjectInterface,
                                                     ObjectInterface,
                                                     List[PteRun]],
@@ -1161,7 +1297,7 @@ class PteEnumerator(object):
         given processes. For details see enumerate_ptes docstring.
 
         Returns:
-            A tuple for each process, containing process, a PteEnumerator
+            A tuple for each process, containing the process, a PteEnumerator
             instance for the process and the enumerated PteRun instances.
             (proc, ptenum, list(PteRun))
         """
@@ -1184,6 +1320,7 @@ class PteEnumerator(object):
             pte_runs = ptenum.enumerate_ptes(start=start, 
                                              end=end,
                                              nx_ret=nx_ret,
+                                             subsec_ret=subsec_ret,
                                              zero_ret=zero_ret)
             yield (proc, ptenum, pte_runs)
 
@@ -1234,11 +1371,13 @@ class PteEnumerator(object):
         if pte_value is None or pte_value == 0:
             return True
 
+        if self._soft_swizzle_mask and not (self._soft_swizzle_mask & pte_value):
+            pte_value = pte_value & self._invalid_pte_mask_negated
         # Guard Pages or Demand Zero pages with a modified Protection.
         # These have only the _MMPTE_SOFTWARE.Protection field set.
         if not (pte_value & self._soft_protection_mask_negated):
             return True
-            
+
         return False
 
 
@@ -1260,7 +1399,7 @@ class PteEnumerator(object):
                 entry = self.kernel_layer.read(
                     self.mmpfn_db.vol.offset + offset,
                     self._mmpfn_entry_size)
-            except:
+            except Exception:
                 # MMPFN entry inaccessible
                 return None
 
@@ -1268,30 +1407,61 @@ class PteEnumerator(object):
 
 
     def _get_u4_member_raw(self, mmpfn_entry_raw):
-        return mmpfn_entry_raw[self._mmpfn_entry_u4_offset: \
-                               self._mmpfn_entry_u4_offset + \
-                                   self._mmpfn_entry_u4_size]
+        u4 = mmpfn_entry_raw[self._mmpfn_entry_u4_offset: \
+                             self._mmpfn_entry_u4_offset + \
+                             self._mmpfn_entry_u4_size]
+        unpack_str = '<Q' if self._mmpfn_entry_u4_size == 8 else '<I'
+        return struct.unpack(unpack_str, u4)[0]
+
+
+    def _get_originalpte_member_raw(self, mmpfn_entry_raw):
+        orig_pte = mmpfn_entry_raw[self._mmpfn_entry_origpte_offset: \
+                                   self._mmpfn_entry_origpte_offset + \
+                                   self._mmpfn_entry_origpte_size]
+        unpack_str = '<Q' if self._mmpfn_entry_origpte_size == 8 else '<I'
+        return struct.unpack(unpack_str, orig_pte)[0]
 
 
     @cache
-    def _get_prototypepte_flag_for_pfn(self, pfn):
+    def _get_modified_page_characteristics(self, pfn) -> dict:
+        mod_chr_dict = {'orig_pte': None, 'has_proto_set': None, 
+                        'orig_pte_is_sub_ptr': None}
+
         mmpfn_entry = self._get_mmpfn_entry_raw(pfn)
         if mmpfn_entry is None:
-            return None
+            vollog.debug("No/empty MMPFN entry for PFN {:d}".format(pfn))
+            return mod_chr_dict
 
+        mod_chr_dict['has_proto_set'] = \
+            self._is_prototypepte_set_for_mmpfn(mmpfn_entry)
+        # if the PrototypePte flag is not set, there is normally no reason
+        # to check the OriginalPte value for being a _MMPTE_SUBSECTION in
+        # order to determine whether or not the page has been modified.
+        # But since we retrieve the MMPFN entry anyways, we keep the values
+        # right away for potential future use
+        mod_chr_dict['orig_pte'] = \
+            self._get_originalpte_member_raw(mmpfn_entry)
+        mod_chr_dict['orig_pte_is_sub_ptr'] = \
+            self._is_originalpte_subsec_ptr(mod_chr_dict['orig_pte'])
+
+        return mod_chr_dict
+
+
+    def _is_prototypepte_set_for_mmpfn(self, mmpfn_entry):
         u4 = self._get_u4_member_raw(mmpfn_entry)
-        unpack_str = '<Q' if self._mmpfn_entry_u4_size == 8 else '<I'
-        return bool(struct.unpack(unpack_str, u4)[0] & 
-                    self._mmpfn_entry_proto_mask)
+        return bool(u4 & self._mmpfn_entry_protopte_mask)
+
+
+    def _is_originalpte_subsec_ptr(self, orig_pte):
+        return bool(not (orig_pte & self._valid_mask) and \
+                    orig_pte & self._prototype_mask)
 
 
     def _get_mmpfn_pteframe_for_mmpfn_raw(self, mmpfn_entry_raw):
         """Retrieves u4.PteFrame from a raw MMPFN entry. See also
         _get_mmpfn_entry_raw."""
         u4 = self._get_u4_member_raw(mmpfn_entry_raw)
-        unpack_str = '<Q' if self._mmpfn_entry_u4_size == 8 else '<I'
-        u4_unpacked = struct.unpack(unpack_str, u4)[0]
-        return (u4_unpacked & self._mmpfn_pteframe_bit_mask) >> \
+        return (u4 & self._mmpfn_pteframe_bit_mask) >> \
             self._mmpfn_pteframe_bit_offset
 
 
@@ -1305,20 +1475,35 @@ class PteEnumerator(object):
         return struct.unpack(unpack_str, pteAddr)[0]
 
 
-    def _get_protopte_addr_and_val_from_vad(self, vaddr: int):
+    def _get_subsec_proto_wrapper_for_vad(self, vad):
+        if not "Subsection" in vad.vol.members.keys():
+            return None
+
+        subsec = vad.Subsection.real
+        sub_proto_wrp = None
+        if subsec in self._subsec_dict:
+            return self._subsec_dict[subsec]
+        else:
+            sub_proto_wrp = \
+                SubsecProtoWrapper(vad, self._PAGE_BITS, self._PTE_SIZE)
+            self._subsec_dict[subsec] = sub_proto_wrp
+
+        return sub_proto_wrp
+
+
+    def _get_protopte_addr_and_val_via_vad(self, vaddr: int):
         vad_start, vad_end, vad = self.get_vad_for_vaddr(vaddr)
         if not vad:
             return [None, None]
 
-        if not "Subsection" in vad.vol.members.keys():
+        sub_proto_wrp = self._get_subsec_proto_wrapper_for_vad(vad)
+        if not sub_proto_wrp:
             return [None, None]
 
-        subsec = vad.Subsection
-        if not subsec in self._subsec_dict:
-            new_el = SubsecProtoWrapper(vad, self._PAGE_BITS, self._PTE_SIZE)
-            self._subsec_dict[subsec] = new_el
-
-        pte_addr = self._subsec_dict[subsec].get_pteaddr_for_vaddr(vad, vad_start, vad_end, vaddr)
+        pte_addr = sub_proto_wrp.get_pteaddr_for_vaddr(vad,
+                                                       vad_start,
+                                                       vad_end,
+                                                       vaddr)
         pte_value = None
         # An empy pte_addr normally means that no Subsection for the given vaddr
         # was found. Potentially because of a not yet populated SUBSECTION for
@@ -1347,7 +1532,7 @@ class PteEnumerator(object):
                 return [None, None, None, None]
 
             proto_vaddr, proto_value = \
-                self._get_protopte_addr_and_val_from_vad(vaddr)
+                self._get_protopte_addr_and_val_via_vad(vaddr)
             # We are only using physical PTE addresses internally
             try:
                 if proto_vaddr:
@@ -1358,18 +1543,23 @@ class PteEnumerator(object):
 
         else:
             state = state_enum['PROTOPOINT']
+            if self._proto_swizzle_mask and \
+                    not(pte_value & self._proto_swizzle_mask):
+                proto_vaddr = proto_vaddr & self._invalid_proto_mask
             # The protection value is at a different offset for proto-pointers
             # (instances of _MMPTE_PROTOTYPE) than the others, so we can't use 
             # _get_soft_protection_value here.
             prot_value = self._get_proto_protection_value(pte_value)
-            executable = self._protection_value_states_executable(prot_value)
-            if not executable and nx_ret:
+            if prot_value != 0:
+                executable = self._protection_value_states_executable(prot_value)
+
+            if executable is False and nx_ret:
                 return [None, None, None, None]
 
             try:
                 proto_paddr = self.kernel_layer.translate(proto_vaddr)[0]
                 proto_value = self._read_pte_value(self.phys_layer, proto_paddr)
-            except:
+            except Exception:
                 # Prototype PTE inaccessible
                 proto_paddr = proto_value = None
         
@@ -1386,30 +1576,6 @@ class PteEnumerator(object):
                          # TODO paged out paging structures must be considered
                          pte_layer=self.phys_layer)
         return [proto_paddr, proto_vaddr, proto_value, pte_run]
-
-
-    @args_not_none
-    @verify_initialized
-    def resolve_vaddr(self, vaddr, nx_ret=False, zero_ret=False):
-        """Returns a PteRun instance for the given virtual address.
-        Currently, simply a wrapper around enumerate_ptes."""
-        # TODO when using this function intensively ( > 10000 ), enumerate_ptes
-        # slows down and should be replaced by the following two lines:
-        # pte_addr, pte_value = self._get_pte_addr_and_val_for_va(vaddr)
-        # return self.resolve_pte(vaddr, pte_value, pte_addr)
-        # Those two lines are, however, currently not used as
-        # _get_pte_addr_and_val_for_va doesn't support large/huge pages yet.
-        pte_runs = list(self.enumerate_ptes(start=vaddr, 
-                                            end=vaddr,
-                                            nx_ret=nx_ret,
-                                            zero_ret=zero_ret))
-        if pte_runs:
-            if len(pte_runs) > 1:
-                vollog.warning("enumerate_ptes returned multiple PteRuns for "
-                               "a single virtual address. Shouldn't be the "
-                               "case.")
-            return pte_runs[0]
-        return None
 
 
     @lru_cache(maxsize=64)
@@ -1485,7 +1651,7 @@ class PteEnumerator(object):
 
     @args_not_none
     @verify_initialized
-    def resolve_pte_by_paddr(self, pte_paddr: int) -> PteRun:
+    def resolve_pte_by_pte_paddr(self, pte_paddr: int) -> PteRun:
         """Wrapper around resolve_pte, which ignores the vaddr and pte_vaddr
         arguments. For a complete PteRun result, resolve_pte should be used
         with all required arguments."""
@@ -1500,41 +1666,107 @@ class PteEnumerator(object):
             self._try_fix_pte_run(pte_run)
             self._check_for_protovad(pte_run)
             return pte_run
-        except:
+        except Exception:
             return None
+
+    @args_not_none
+    @verify_initialized
+    def resolve_pte_by_vaddr(self, vaddr, nx_ret=False, zero_ret=False):
+        """Returns a PteRun instance for the given virtual address.
+        Currently, simply a wrapper around enumerate_ptes."""
+        # TODO when using this function intensively ( > 10000 ), enumerate_ptes
+        # slows down and should be replaced by the following two lines:
+        # pte_addr, pte_value = self._get_pte_addr_and_val_for_va(vaddr)
+        # return self.resolve_pte(vaddr, pte_value, pte_addr)
+        # Those two lines are, however, currently not used as
+        # _get_pte_addr_and_val_for_va doesn't support large/huge pages yet.
+        
+        # enumerate_ptes requires an aligned address
+        base_vaddr =  vaddr & 0xffffffffff000
+        pte_runs = list(self.enumerate_ptes(start=base_vaddr, 
+                                            end=vaddr,
+                                            nx_ret=nx_ret,
+                                            zero_ret=zero_ret))
+        if pte_runs:
+            if len(pte_runs) > 1:
+                vollog.warning("enumerate_ptes returned multiple PteRuns for "
+                               "a single virtual address. Shouldn't be the "
+                               "case.")
+            return pte_runs[0]
+        return None
 
 
     @args_not_none
     @verify_initialized
-    def resolve_pte_by_vaddr(self, pte_vaddr: int) -> PteRun:
+    def resolve_pte_by_pte_vaddr(self,
+                             pte_vaddr: int,
+                             is_proto: bool = False,
+                             vaddr: int = None) -> PteRun:
         """Wrapper around resolve_pte, which ignores the vaddr
         argument. For a complete PteRun result, resolve_pte should be used
         with all required arguments."""
         try:
             pte_paddr = self.proc_layer.translate(pte_vaddr)[0]
             pte_value = self._read_pte_value(self.phys_layer, pte_paddr)
-            pte_run = self.resolve_pte(
-                None, pte_value, pte_paddr, pte_vaddr=pte_vaddr, zero_ret=False)
+            proto_ptr_run = None
+            if is_proto:
+                proto_ptr_run = PteRun(self,
+                                        None,
+                                        vaddr,
+                                        is_proto=False)
+            pte_run = self.resolve_pte(vaddr,
+                                        pte_value,
+                                        pte_paddr,
+                                        pte_vaddr=pte_vaddr,
+                                        zero_ret=False,
+                                        is_proto=is_proto,
+                                        proto_ptr_run=proto_ptr_run)
             self._try_fix_pte_run(pte_run)
             self._check_for_protovad(pte_run)
             return pte_run
-        except:
+        except Exception as e:
+            vollog.debug(e)
             return None
 
 
     @args_not_none
     @verify_initialized
-    def resolve_pte_by_value(self, pte_value: int) -> PteRun:
+    def resolve_pte_by_pte_value(self,
+                                 pte_value: int,
+                                 is_proto: bool = False) -> PteRun:
         """Wrapper around resolve_pte, which ignores the vaddr and pte_paddr
         arguments. For a complete PteRun result, resolve_pte should be used
         with all required arguments."""
         try:
-            pte_run = self.resolve_pte(None, pte_value, None, zero_ret=False)
+            if self.pid is None:
+                self.pid = 0
+            pte_run = self.resolve_pte(
+                0, pte_value, None, zero_ret=False, is_proto=is_proto)
             self._try_fix_pte_run(pte_run)
             self._check_for_protovad(pte_run)
             return pte_run
-        except:
+        except Exception:
             return None
+
+
+    @args_not_none
+    @verify_initialized
+    def resolve_iso_pte_by_vaddr(self, vaddr: int) -> PteRun:
+        """Tries to resolve the given virtual address to a PteRun of the
+        corresponding Image Section Object."""
+        try:
+            pte_addr, pte_value = self._get_protopte_addr_and_val_via_vad(vaddr)
+            pte_paddr = self.proc_layer.translate(pte_addr)[0]
+            return self.resolve_pte(vaddr,
+                                    pte_value,
+                                    pte_paddr,
+                                    is_proto=True,
+                                    pte_vaddr=pte_addr,
+                                    zero_ret=False)
+        except Exception:
+            vollog.debug(f"{self.pid}-{self.proc_name} failed to get img_pte")
+
+        return None
 
 
     def resolve_pte(self,
@@ -1545,15 +1777,22 @@ class PteEnumerator(object):
                     is_proto: bool = None,
                     proto_ptr_run: PteRun = None,
                     nx_ret: bool = False,
+                    subsec_ret: bool = False,
                     zero_ret: bool = True) -> PteRun:
         """This function returns a PteRun object for pages that are executable.
         It will, however, skip pages that have not yet been accessed, even if
         they would be executable once accessed."""
 
+        pte_dbg_str = (f"ptenum.resolve_pte: resolving PID: {self.pid:d} " +
+                       (f"VADDR: 0x{vaddr:x}" if vaddr else str(vaddr)))
+        vollog.debug(pte_dbg_str + " PTE_VALUE: " + \
+                     (f"0x{pte_value:x}" if pte_value else str(pte_value)))
         # is_proto_ptr is not set to True in here, but only 
         # in _parse_proto_pointer
         is_proto_ptr = False
         has_proto_set = None
+        orig_pte_value = None
+        orig_pte_is_sub_ptr = None
         length = self._PAGE_SIZE
         executable = None
         phys_addr = None
@@ -1570,6 +1809,7 @@ class PteEnumerator(object):
         # The other case is a demand-zero MMU PTE, which we definitely skip
         # for nx_ret or zero_ret.
         if self._is_demand_zero_pte(pte_value):
+            vollog.debug(pte_dbg_str + " is_demand_zero")
             if nx_ret or zero_ret:
                 return None
             state = state_enum['SOFTZERO']
@@ -1580,6 +1820,7 @@ class PteEnumerator(object):
 
         # active page
         elif pte_value & self._valid_mask:
+            vollog.debug(pte_dbg_str + " is_valid")
             if not (pte_value & self._nx_mask):
                 executable = True
             elif nx_ret:
@@ -1593,13 +1834,16 @@ class PteEnumerator(object):
                 vollog.warning("A large or huge page at this point is not yet "
                                "fully supported, since we can't differentiate "
                                "between those two here at the moment. We'll "
-                               "assume a large page, but this could be false.")
+                               "assume a large page, but this could be false. "
+                               "vaddr: 0x{:x}".format(vaddr))
+                               
             state = state_enum['HARD']
             pfn = self._get_hardware_pfn_for_pte_value(pte_value)
             phys_addr = self.get_phys_addr_from_pfn(pfn, vaddr or 0)
 
         # proto-pointer
         elif not is_proto and (pte_value & self._prototype_mask):
+            vollog.debug(pte_dbg_str + " is_proto_pointer")
             proto_paddr, proto_vaddr, proto_value, proto_pte_run = \
                 self._parse_proto_pointer(vaddr, pte_paddr, pte_value, nx_ret)
 
@@ -1613,10 +1857,14 @@ class PteEnumerator(object):
                                     is_proto=True,
                                     proto_ptr_run=proto_pte_run,
                                     nx_ret=nx_ret,
+                                    subsec_ret=subsec_ret,
                                     zero_ret=zero_ret)
 
         # subsection
         elif is_proto and (pte_value & self._prototype_mask):
+            if subsec_ret:
+                return None
+            vollog.debug(pte_dbg_str + " is_subsec")
             state = state_enum['SUBSEC']
             prot_value = self._get_subsec_protection_value(pte_value)
             executable = self._protection_value_states_executable(prot_value)
@@ -1635,6 +1883,7 @@ class PteEnumerator(object):
 
         # in transition
         elif pte_value & self._transition_mask:
+            vollog.debug(pte_dbg_str + " is_transition")
             prot_value = self._get_trans_protection_value(pte_value)
             executable = self._protection_value_states_executable(prot_value)
             if not executable and nx_ret:
@@ -1647,6 +1896,7 @@ class PteEnumerator(object):
 
         # pagefile PTE
         elif pte_value & self._soft_pagefilehigh_mask:
+            vollog.debug(pte_dbg_str + " is_soft")
             state = state_enum['SOFT']
             prot_value = self._get_soft_protection_value(pte_value)
             executable = self._protection_value_states_executable(prot_value)
@@ -1657,7 +1907,7 @@ class PteEnumerator(object):
                 (((pte_value & self._soft_pagefilehigh_mask)
                   >> self._soft_pagefilehigh_start)
                  << self._PAGE_BITS) | ((vaddr or 0) & self._PAGE_BITS_MASK)
-            # The weird bit is handled within PteRun
+            # The swizzle bit is handled within PteRun.
             # For an explanation, see comment in PteEnumerator._init_variables
 
             # Compressed memory has typically an index of 2
@@ -1670,7 +1920,7 @@ class PteEnumerator(object):
                     swap_layer_name = \
                         self._swap_layer_base_str + str(pagefile_idx)
                     data_layer = self.context.layers[swap_layer_name]
-                except:
+                except Exception:
                     # We don't have a swap_layer for this PTE = The pagefile
                     # hasn't been provided.
                     pass
@@ -1689,8 +1939,12 @@ class PteEnumerator(object):
                     is_proto))
 
         if phys_addr:
+            vollog.debug(pte_dbg_str + " has_pfn")
             pfn = phys_addr >> self._PAGE_BITS
-            has_proto_set = self._get_prototypepte_flag_for_pfn(pfn)
+            mod_chr_dict = self._get_modified_page_characteristics(pfn)
+            has_proto_set = mod_chr_dict['has_proto_set']
+            orig_pte_value = mod_chr_dict['orig_pte']
+            orig_pte_is_sub_ptr = mod_chr_dict['orig_pte_is_sub_ptr']
 
         if is_proto:
             return PteRun(self,
@@ -1701,6 +1955,8 @@ class PteEnumerator(object):
                           pte_value=pte_value,
                           is_proto=is_proto,
                           has_proto_set=has_proto_set,
+                          orig_pte_value=orig_pte_value,
+                          orig_pte_is_sub_ptr=orig_pte_is_sub_ptr,
                           proto_ptr_run=proto_ptr_run,
                           is_proto_ptr=is_proto_ptr,
                           is_exec=executable,
@@ -1722,6 +1978,8 @@ class PteEnumerator(object):
                           pte_value=pte_value,
                           is_proto=is_proto,
                           has_proto_set=has_proto_set,
+                          orig_pte_value=orig_pte_value,
+                          orig_pte_is_sub_ptr=orig_pte_is_sub_ptr,
                           is_proto_ptr=is_proto_ptr,
                           is_exec=executable,
                           pte_paddr=pte_paddr,
@@ -1952,6 +2210,7 @@ class PteEnumerator(object):
             for vad in proc.get_vad_root().traverse():
                 self._vad_dict[proc_offset].append(
                     (vad.get_start(), vad.get_end(), vad))
+                    # (vad.get_start(), vad.get_end(), vad, PteEnumerator.vad_contains_image_file(vad)))
         self._proc_vads = self._vad_dict[proc_offset]
 
         self._initialize_internals()
@@ -1959,7 +2218,8 @@ class PteEnumerator(object):
 
         # used for the disassembler
         self.arch_proc = self.arch_os.lower()
-        if self.proc.get_is_wow64() and self.arch_os == "Intel64":
+        self.is_wow64 = self.proc.get_is_wow64()
+        if self.is_wow64 and self.arch_os == "Intel64":
             self.arch_proc = "intel"
 
 
@@ -1986,8 +2246,10 @@ class PteEnumerator(object):
 
         self.arch_os = self.kernel_layer.metadata.get("architecture")
         if self.arch_os != "Intel64":
-            vollog.error("Unsupported architecture: {:s}".format(self.arch_os))
-            raise RuntimeError(f"Unsupported architecture: {self.arch_os:s}")
+            err_msg = ("This architecture is not yet supported: {:s}"
+                       .format(self.arch_os))
+            vollog.error(err_msg)
+            raise RuntimeError(err_msg)
 
         vers = info.Info.get_version_structure(self.context,
                                                self.kernel.layer_name,
@@ -1997,8 +2259,7 @@ class PteEnumerator(object):
         # Used for pretty-printing MMPTE structs
         for state in state_to_mmpte.values():
             self.context.symbol_space[self.symbol_table].set_type_class(state, MMPTE)
-            # self.context.symbol_space[self.kernel.symbol_table_name].set_type_class(state, MMPTE)
-        
+
         self._init_masks()
         self._init_enums()
         self._init_variables()
@@ -2010,6 +2271,29 @@ class PteEnumerator(object):
         bitlength = member.vol.end_bit - member.vol.start_bit
         mask = ( ((1 << bitlength) - 1) << start )
         return (start, mask)
+
+
+    # https://i.blackhat.com/USA-19/Thursday/us-19-Sardar-Paging-All-Windows-Geeks-Finding-Evil-In-Windows-10-Compressed-Memory-wp.pdf
+    # taken from https://github.com/volatilityfoundation/volatility3/pull/772
+    def _get_invalid_pte_mask(self):
+        if self.kernel.has_symbol("MiInvalidPteMask"):
+            pte_type = "unsigned int"
+            if self._PTE_SIZE == 8:
+                pte_type = "unsigned long long"
+
+            return self.kernel.object(
+                pte_type, 
+                offset=self.kernel.get_symbol("MiInvalidPteMask").address)
+
+        if self.kernel.has_symbol("MiState"):
+            system_information = self.kernel.object(
+                "_MI_SYSTEM_INFORMATION",
+                offset=self.kernel.get_symbol("MiState").address)
+            if system_information.Hardware.has_member('InvalidPteMask'):
+                return system_information.Hardware.InvalidPteMask
+
+        return 0
+
 
     def _init_masks(self):
         # These structs have especially changed within Windows 10, so we
@@ -2025,7 +2309,16 @@ class PteEnumerator(object):
         self._soft_protection_start, self._soft_protection_mask = \
             self._get_start_and_bitmask(soft_prot)
         self._soft_protection_mask_negated = \
-            0xffffffffffffffff ^ self._soft_protection_mask
+            ((1 << 64) - 1) ^ self._soft_protection_mask
+
+        if (soft_pte.has_member('SwizzleBit')):
+            soft_swizzle = soft_pte.vol.members['SwizzleBit'][1]
+            # The swizzle mask is used to test for the SwizzleBit to be set.
+            _, self._soft_swizzle_mask = \
+                self._get_start_and_bitmask(soft_swizzle)
+            PteRun._SOFT_SWIZZLE_MASK = self._soft_swizzle_mask
+        else:
+            self._soft_swizzle_mask = None
 
         proto_pte = self.kernel.get_type("_MMPTE_PROTOTYPE")
         proto_bit = proto_pte.vol.members['Prototype'][1]
@@ -2036,6 +2329,15 @@ class PteEnumerator(object):
         proto_prot = proto_pte.vol.members['Protection'][1]
         self._proto_protection_start, self._proto_protection_mask = \
             self._get_start_and_bitmask(proto_prot)
+
+        if (proto_pte.has_member('SwizzleBit')):
+            proto_swizzle = proto_pte.vol.members['SwizzleBit'][1]
+            _, self._proto_swizzle_mask = \
+                self._get_start_and_bitmask(proto_swizzle)
+        else:
+            self._proto_swizzle_mask = None
+            self._invalid_proto_offset = None
+            self._invalid_proto_mask = None
 
         subsec_pte = self.kernel.get_type("_MMPTE_SUBSECTION")
         subsec_prot = subsec_pte.vol.members['Protection'][1]
@@ -2051,6 +2353,14 @@ class PteEnumerator(object):
             self._get_start_and_bitmask(trans_prot)
         trans_pfn = trans_pte.vol.members['PageFrameNumber'][1]
         self._trans_pfn_start, _ = self._get_start_and_bitmask(trans_pfn)
+
+        if (trans_pte.has_member('SwizzleBit')):
+            trans_swizzle = trans_pte.vol.members['SwizzleBit'][1]
+            _, self._trans_swizzle_mask = \
+                self._get_start_and_bitmask(trans_swizzle)
+            PteRun._TRANS_SWIZZLE_MASK = self._trans_swizzle_mask
+        else:
+            self._trans_swizzle_mask = None
 
         hard_pte = self.kernel.get_type("_MMPTE_HARDWARE")
         nx_bit = hard_pte.vol.members['NoExecute'][1]
@@ -2106,7 +2416,7 @@ class PteEnumerator(object):
         PteRun._PAGE_BITS = self._PAGE_BITS
         self._PAGE_SIZE = 1 << self._PAGE_BITS
         self._PAGE_BITS_MASK = self._PAGE_SIZE - 1
-        self._PTE_SIZE = 8
+        self._PTE_SIZE = self.kernel.get_type("_MMPTE_HARDWARE").vol.size
         # The empty page test uses this a lot, so we keep it once
         self._ALL_ZERO_PAGE = b"\x00" * self._PAGE_SIZE
         # large and huge pages will probably not occur that often,
@@ -2135,16 +2445,21 @@ class PteEnumerator(object):
         # getting PFN DB
         self._hpp = self.phys_layer.maximum_address >> self._PAGE_BITS
 
+        # PTEs in transition state also have a swizzle bit on newer Windows
+        # versions and we have support for it. The logic is, however, currently
+        # "overruled" anyways, since the usage of MAXPHYADDR gets rid of the
+        # upper bits.
+        # See below for more details.
+        #
         # Actually, MAXPHYADDR could be 52 (depending on Intel documentation),
         # respectively 48 when going with Microsofts definition of
         # _MMPTE_HARDWARE resp. _MMPTE_TRANSITION and their PFN field.
         # It seems, however, that since at least Windows 10 1909, the
-        # PageFrameNumber field for Transition PTEs contains some undocumented
-        # bitflags. So far, we encounted at least the usage of PFN's bit 33
-        # (counting from zero, with a total of 36 bits). In relation to the
-        # whole PTE, this means bit 45. As long as we're unaware of their exact
-        # purpose, we ignore the three most significant bits by setting
-        # MAXPHYADDR to 45. See also
+        # PageFrameNumber field for Transition PTEs uses the SwizzleBit field,
+        # which affects the PFN's bit 33 (counting from zero, with a total
+        # of 36 bits). In relation to the whole PTE, this means bit 45. 
+        # Currently, we simply ignore the three most significant bits
+        # altogether by setting MAXPHYADDR to 45. See also
         # https://github.com/volatilityfoundation/volatility3/pull/475
         # This shouldn't be a problem as long as the flags are not influencing
         # the actual PFN (so far, doesn't seem to be the case), and the
@@ -2171,20 +2486,34 @@ class PteEnumerator(object):
         self._hard_pfn_mask = ((1 << self._maxphyaddr) -1)
         self._hard_pfn_mask ^= (1 << self._hard_pfn_start) - 1
 
-        # TODO With newer Windows versions (based on basic tests, the
-        # earliest version is Windows 10 1803 17134; Windows 10 1709 16299
-        # still behaves "normally"), we see a new (potential) bitflag, which
-        # is undocumented so far. This flag is part of the PageFileHigh
-        # field and hence leads to a wrong swap_offset.
-        # It should be noted, however, that we didn't observe this to be
-        # unset so far. This flag seems also to be set for demand zero PTEs.
-        # Due to this flag, they appear to have a PageFileHigh value of
-        # 0x2000 (only bit 13 set) but resolving those with WinDbg !pte,
-        # returns a demand zero PTE.
-        # Currently we simply unset it for affected Windows versions.
-        # This should be investigated further.
-        PteRun._WEIRD_BIT_MASK = ~(1 << (13 + self._PAGE_BITS))
-        PteRun._APPLY_WEIRD_BIT_MASK = self._kernel_build >= 17134
+        # The swizzle bit indicates if a specific bit of the PTE value has to be
+        # flipped.
+        # See the whitepaper "Extracting Compressed Pages from the Windows 10
+        # Virtual Store" (also known as "Finding Evil in Windows 10 Compressed
+        # Memory") by Omar Sardar and Dimiter Andonov for further details.
+        # https://i.blackhat.com/USA-19/Thursday/us-19-Sardar-Paging-All-Windows-Geeks-Finding-Evil-In-Windows-10-Compressed-Memory-wp.pdf
+        if self._soft_swizzle_mask:
+            self._invalid_pte_mask = self._get_invalid_pte_mask()
+            self._invalid_pte_mask_negated = \
+                ((1 << 64) - 1) ^ self._invalid_pte_mask
+            PteRun._INVALID_SWAP_OFFSET = \
+                ((self._invalid_pte_mask >> self._soft_pagefilehigh_start)
+                << self._PAGE_BITS)
+            PteRun._INVALID_SWAP_MASK = \
+                ((1 << 64) - 1) ^ PteRun._INVALID_SWAP_OFFSET
+            PteRun._INVALID_TRANS_OFFSET = \
+                ((self._invalid_pte_mask >> self._trans_pfn_start)
+                << self._PAGE_BITS)
+            PteRun._INVALID_TRANS_MASK = \
+                ((1 << 64) - 1) ^ PteRun._INVALID_TRANS_OFFSET
+
+        if self._proto_swizzle_mask:
+            if self._invalid_pte_mask is None:
+                self._invalid_pte_mask = self._get_invalid_pte_mask()
+            self._invalid_proto_offset = \
+                self._invalid_pte_mask >> self._proto_protoaddress_start
+            self._invalid_proto_mask = \
+                ((1 << 64) - 1) ^ self._invalid_proto_offset
 
         self.mmpfn_db = self.kernel.get_symbol("MmPfnDatabase").address
         self.mmpfn_db = self.kernel.object(
@@ -2203,9 +2532,12 @@ class PteEnumerator(object):
 
         self._mmpfn_entry_u4_offset = temp_pfn_entry.vol.members['u4'][0]
         self._mmpfn_entry_u4_size = temp_pfn_entry.u4.vol.size
+        self._mmpfn_entry_origpte_offset = \
+            temp_pfn_entry.vol.members['OriginalPte'][0]
+        self._mmpfn_entry_origpte_size = temp_pfn_entry.OriginalPte.vol.size
         mmpfn_entry_proto_offset = \
             temp_pfn_entry.u4.PrototypePte.vol.start_bit
-        self._mmpfn_entry_proto_mask = 1 << mmpfn_entry_proto_offset
+        self._mmpfn_entry_protopte_mask = 1 << mmpfn_entry_proto_offset
 
         self._mmpfn_pteframe_bit_offset = \
             temp_pfn_entry.u4.PteFrame.vol.start_bit
@@ -2248,15 +2580,21 @@ class PteEnumerator(object):
             (vad_start, vad_end, VAD)"""
         if proc is None:
             proc_vads = self._proc_vads
+            proc = self.proc
         else:
             proc_vads = self._vad_dict[proc.vol.offset]
 
         for start, end, vad in proc_vads:
             if start <= vaddr <= end:
                 return (start, end, vad)
-        if not supress_warning:
-            vollog.warning("No VAD found for process {:d} and address 0x{:x}"
-                           .format(proc.UniqueProcessId, vaddr))
+        warning_string = ("No VAD found for process {:d} and address 0x{:x}. "
+                          "This could indicate hidden pages or a yet unknown "
+                          "case."
+                          .format(proc.UniqueProcessId, vaddr))
+        if supress_warning:
+            vollog.info(warning_string)
+        else:
+            vollog.warning(warning_string)
         return (None, None, None)
 
 
@@ -2304,6 +2642,6 @@ class PteEnumerator(object):
         pte_value = self._read_pte_value(self.proc_layer, pte_addr)
         try:
             pte_addr = self.proc_layer.translate(pte_addr)[0]
-        except:
+        except Exception:
             pte_addr = None
         return [pte_addr, pte_value]
