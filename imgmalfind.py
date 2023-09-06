@@ -340,13 +340,7 @@ class ImageMalfind(interfaces.plugins.PluginInterface):
                                             optional = True),
                 requirements.URIRequirement(name="filters",
                                             description="Additional allow-list filters (as a json-file)",
-                                            optional=True),
-                requirements.BooleanRequirement(name = 'include_demand_zero',
-                                            description = ("Include PTEs that have yet no corresponding page. This will also include \"PTEs\" that "
-                                                           "not yet have any valid vaddr, but a valid Page Table, and might lead to Warnings/False "
-                                                           "Positives if not dealt with accordingly."),
-                                            default = False,
-                                            optional = True)]
+                                            optional=True)]
 
     def run(self):
         filter_func = pslist.PsList.create_pid_filter(self.config.get('pid', None))
