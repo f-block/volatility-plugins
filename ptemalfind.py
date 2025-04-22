@@ -41,7 +41,7 @@ from typing import Dict, Tuple, Generator, List, Type, Optional
 from volatility3.framework import interfaces, renderers, constants
 from volatility3.framework.configuration import requirements
 from volatility3.framework.renderers import format_hints
-from volatility3.plugins.windows import pslist, vadinfo
+from volatility3.plugins.windows import pslist, vadinfo, info
 from volatility3.plugins.windows.ptenum import PteEnumerator, PteRun
 from volatility3.framework.interfaces.objects import ObjectInterface
 
@@ -106,6 +106,9 @@ class PteMalfind(interfaces.plugins.PluginInterface):
                                                 optional = True),
                 requirements.PluginRequirement(name = 'pslist',
                                                plugin = pslist.PsList,
+                                               version = (3, 0, 0)),
+                requirements.PluginRequirement(name = 'info',
+                                               plugin = info.Info,
                                                version = (2, 0, 0)),
                 requirements.ListRequirement(name = 'pid',
                                             element_type = int,
@@ -164,8 +167,7 @@ class PteMalfind(interfaces.plugins.PluginInterface):
                                   self._generator(
                                       pslist.PsList.list_processes(
                                           context = self.context,
-                                          layer_name = layer_name,
-                                          symbol_table = symbol_table,
+                                          kernel_module_name=self.config["kernel"],
                                           filter_func = filter_func)))
 
 

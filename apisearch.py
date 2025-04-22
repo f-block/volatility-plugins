@@ -34,7 +34,7 @@ https://insinuator.net/2021/12/release-of-pte-analysis-plugins-for-volatility-3/
 import logging, pefile, codecs
 from tempfile import SpooledTemporaryFile
 from typing import Callable, List, Generator, Iterable, Type, Optional
-from volatility3.plugins.windows import dumpfiles, dlllist, pslist
+from volatility3.plugins.windows import dumpfiles, pedump, pslist
 from volatility3.plugins.windows.ptenum import PteEnumerator
 from volatility3.plugins.windows.ptemalfind import PteMalfindInterface
 from volatility3.framework import renderers, interfaces, exceptions, constants
@@ -178,7 +178,10 @@ class ImportExportParser:
         try:
             pe_file.DIRECTORY_ENTRY_EXPORT
         except AttributeError:
-            pe_file.parse_data_directories()
+            try:
+                pe_file.parse_data_directories()
+            except:
+                pass
 
         try:
             for exp in pe_file.DIRECTORY_ENTRY_EXPORT.symbols:
@@ -316,7 +319,7 @@ class ImportExportParser:
                                                                 "windows",
                                                                 "pe",
                                                                 class_types = pe.class_types)
-        return dlllist.DllList.dump_pe(context, pe_table_name, dll_entry, cls.open_method, proc_layer)
+        return cls.dump_pe(context, pe_table_name, dll_entry, proc_layer)
 
 
     @classmethod
@@ -348,6 +351,32 @@ class ImportExportParser:
 
 
     @classmethod
+    def dump_pe(cls, context, pe_table_name, ldr_entry, proc_layer):
+        file_handle = None
+        try:
+            file_handle = cls.open_method("")
+            base = ldr_entry.DllBase
+            dos_header = context.object(
+                pe_table_name + constants.BANG + "_IMAGE_DOS_HEADER",
+                offset=base,
+                layer_name=proc_layer,
+            )
+
+            for offset, data in dos_header.reconstruct():
+                file_handle.seek(offset)
+                file_handle.write(data)
+        except (
+            OSError,
+            exceptions.VolatilityException,
+            OverflowError,
+            ValueError,
+        ) as excp:
+            vollog.debug(f"Unable to dump PE file at offset {base}: {excp}")
+            return None
+        return file_handle
+
+
+    @classmethod
     def get_exports_from_module_old(cls, context, config, config_path, vad, dll_entry, proc_layer, wow64=False):
         """Parses the DLL from the given VAD and returns the Exports. This
         function uses only the VAD's content itself, but not the
@@ -363,7 +392,7 @@ class ImportExportParser:
                                                                 "windows",
                                                                 "pe",
                                                                 class_types = pe.class_types)
-        file_handle = dlllist.DllList.dump_pe(context, pe_table_name, dll_entry, cls.open_method, proc_layer)
+        file_handle = cls.dump_pe(context, pe_table_name, dll_entry, proc_layer)
         return cls.get_exports(dll_entry, file_handle=file_handle, img_base=vad_start, byte_index=True, wow64=wow64)
 
 
@@ -521,7 +550,8 @@ class ApiSearch(interfaces.plugins.PluginInterface, PteMalfindInterface):
                                              description = 'Filter on specific process IDs',
                                              element_type = int,
                                              optional = True),
-                requirements.PluginRequirement(name = 'pslist', plugin = pslist.PsList, version = (2, 0, 0)),
+                requirements.PluginRequirement(name = 'pslist', plugin = pslist.PsList, version = (3, 0, 0)),
+                requirements.PluginRequirement(name = 'pedump', plugin = pedump.PEDump, version = (2, 0, 0)),
                 requirements.IntRequirement(name = 'address',
                                             description = "A VAD's virtual start address to include " \
                                                           "(all other address ranges are excluded). This must be " \
@@ -556,8 +586,7 @@ class ApiSearch(interfaces.plugins.PluginInterface, PteMalfindInterface):
                                   self._generator(
                                       pslist.PsList.list_processes(
                                           context = self.context,
-                                          layer_name = layer_name,
-                                          symbol_table = symbol_table,
+                                          kernel_module_name=self.config["kernel"],
                                           filter_func = filter_func)))
 
 

@@ -44,6 +44,7 @@ try:
     import capstone
     CAPSTONE_PRESENT = True
 except ImportError:
+    # handled later
     pass
 
 try:
@@ -313,7 +314,7 @@ class ImageMalfind(interfaces.plugins.PluginInterface):
         return [*kernel_reqs,
                 requirements.PluginRequirement(name = 'pslist',
                                                plugin = pslist.PsList,
-                                               version = (2, 0, 0)),
+                                               version = (3, 0, 0)),
                 requirements.ListRequirement(name = 'pid',
                                             element_type = int,
                                             description = "Process ID to include (all other processes are excluded)",
@@ -338,7 +339,7 @@ class ImageMalfind(interfaces.plugins.PluginInterface):
                                             description = "",
                                             default = False,
                                             optional = True),
-                requirements.URIRequirement(name="filters",
+                requirements.URIRequirement(name="allow_filters",
                                             description="Additional allow-list filters (as a json-file)",
                                             optional=True)]
 
@@ -361,19 +362,18 @@ class ImageMalfind(interfaces.plugins.PluginInterface):
                                    ("Modified bytes Count", int),
                                    ("Seperator1", str),
                                    ("Orig Hexdump", format_hints.HexBytes), 
-                                   ("Orig Disassembly", interfaces.renderers.Disassembly),
+                                   ("Orig Disassembly", renderers.Disassembly),
                                    ("Seperator2", str),
                                    ("New Hexdump", format_hints.HexBytes), 
-                                   ("New Disassembly", interfaces.renderers.Disassembly),
+                                   ("New Disassembly", renderers.Disassembly),
                                    ("Target Description", str),
                                    ("Target Module", str),
                                    ("Target Hexdump", format_hints.HexBytes), 
-                                   ("Target Disassembly", interfaces.renderers.Disassembly)],
+                                   ("Target Disassembly", renderers.Disassembly)],
                                   self._generator(
                                       pslist.PsList.list_processes(
                                           self.context,
-                                          layer_name = layer_name,
-                                          symbol_table = symbol_table,
+                                          kernel_module_name=self.config["kernel"],
                                           filter_func = filter_func)))
 
 
@@ -458,12 +458,12 @@ class ImageMalfind(interfaces.plugins.PluginInterface):
         modified_vad_name = analysis_state.mod_vad_name.lower()
         target_vad_name = last_target.target_vad_name.lower()
         proc_name = analysis_state.ptenum.proc_name.lower()
-        for filter in self.allow_list_filters:
+        for fl in self.allow_list_filters:
             # While we use search here (which matches anywhere in the string),
             # it is advised to match as much as possible.
-            if re.search(filter['process'], proc_name) and \
-                    re.search(filter['modified_vad'], modified_vad_name) and \
-                    re.search(filter['target_vad'], target_vad_name):
+            if re.search(fl['process'], proc_name) and \
+                    re.search(fl['modified_vad'], modified_vad_name) and \
+                    re.search(fl['target_vad'], target_vad_name):
                 analysis_state.is_benign_mod = True
                 return
 
@@ -956,43 +956,43 @@ class ImageMalfind(interfaces.plugins.PluginInterface):
 
         # Builtin allow-list
         self.allow_list_filters = [
-            {'process': '^firefox\.exe$',
+            {'process': r'^firefox\.exe$',
              'modified_vad': r'^\\windows\\system32\\(ntdll|kernelbase|user32|kernel32)\.dll$',
              'target_vad': r'^\\program files( \(x86\))?\\mozilla firefox\\(xul|mozglue)\.dll$'},
-            {'process': '^firefox\.exe$',
+            {'process': r'^firefox\.exe$',
              'modified_vad': r'^\\windows\\system32\\ntdll\.dll$',
              'target_vad': r'^\\program files( \(x86\))?\\mozilla firefox\\firefox\.exe$'},
-            {'process': '^msedge\.exe$',
+            {'process': r'^msedge\.exe$',
              'modified_vad': r'^\\windows\\system32\\ntdll\.dll$',
              'target_vad': r'^\\program files( \(x86\))?\\microsoft\\edge\\application\\[\d\.]+\\msedge_elf\.dll$'},
-            {'process': '^msedge\.exe$',
+            {'process': r'^msedge\.exe$',
              'modified_vad': r'^\\windows\\system32\\ntdll\.dll$',
              'target_vad': r'^\\program files( \(x86\))?\\microsoft\\edge\\application\\msedge\.exe$'},
-            {'process': '^chrome\.exe$',
+            {'process': r'^chrome\.exe$',
              'modified_vad': r'^\\windows\\system32\\ntdll\.dll$',
              'target_vad': r'^\\program files( \(x86\))?\\google\\chrome\\application\\[\d\.]+\\chrome_elf\.dll$'},
-            {'process': '^chrome\.exe$',
+            {'process': r'^chrome\.exe$',
              'modified_vad': r'^\\windows\\system32\\ntdll\.dll$',
              'target_vad': r'^\\program files( \(x86\))?\\google\\chrome\\application\\chrome\.exe$'},
-            {'process': '^(winword|excel|outlook|onenotem)\.exe$',
+            {'process': r'^(winword|excel|outlook|onenotem)\.exe$',
              'modified_vad': r'^\\windows\\system32\\(advapi32|combase|ole32|oleaut32|ntdll|kernelbase|shell32|user32|kernel32|win32u)\.dll$',
              'target_vad': r'^\\program files( \(x86\))?\\microsoft office\\root\\vfs\\programfilescommonx64\\microsoft shared\\office\d+\\(mso|mso40uiwin32client|mso30win32client)\.dll$'},
-            {'process': '^(winword|excel|outlook|onenotem)\.exe$',
+            {'process': r'^(winword|excel|outlook|onenotem)\.exe$',
              'modified_vad': r'^\\windows\\system32\\(advapi32|combase|ole32|oleaut32|ntdll|kernelbase|shell32|user32|kernel32)\.dll$',
              'target_vad': r'^\\program files( \(x86\))?\\common files\\microsoft shared\\clicktorun\\appvisvsubsystems(32|64)\.dll$'},
             {'process': '.',
              'modified_vad': r'^\\windows\\system32\\(advapi32|combase|oleaut32|ntdll|kernel32|taskschd)\.dll$',
              'target_vad': r'^\\program files( \(x86\))?\\avg\\antivirus\\(chrome_elf|aswjsflt|snxhk|aswhook)\.dll$'},
-            {'process': '^firefox\.exe$',
+            {'process': r'^firefox\.exe$',
              'modified_vad': r'^\\program files( \(x86\))?\\mozilla firefox\\(nss3|xul)\.dll$',
              'target_vad': r'^\\program files( \(x86\))?\\avg\\antivirus\\(aswjsflt|snxhk|aswhook)\.dll$'},
-            {'process': '^firefox\.exe$',
+            {'process': r'^firefox\.exe$',
              'modified_vad': r'^\\program files( \(x86\))?\\avg\\antivirus\\snxhk\.dll$',
              'target_vad': r'^\\program files( \(x86\))?\\mozilla firefox\\mozglue\.dll$'},
-            {'process': '^chrome\.exe$',
+            {'process': r'^chrome\.exe$',
              'modified_vad': r'^\\program files( \(x86\))?\\google\\chrome\\application\\[\d\.]+\\chrome\.dll$',
              'target_vad': r'^\\program files( \(x86\))?\\avg\\antivirus\\(aswjsflt|snxhk|aswhook)\.dll$'},
-            {'process': '^msedge\.exe$',
+            {'process': r'^msedge\.exe$',
              'modified_vad': r'^\\program files( \(x86\))?\\microsoft\\edge\\application\\[\d\.]+\\msedge\.dll$',
              'target_vad': r'^\\program files( \(x86\))?\\avg\\antivirus\\(aswjsflt|snxhk|aswhook)\.dll$'}
         ]
@@ -1002,10 +1002,10 @@ class ImageMalfind(interfaces.plugins.PluginInterface):
 
 
     def load_additional_filters(self):
-        if self.config.get("filters", None) is None:
+        if self.config.get("allow_filters", None) is None:
             return
-        with resources.ResourceAccessor().open(self.config["filters"], "rb") as filter:
-            additional_filters_raw = filter.file.read().lower()
+        with resources.ResourceAccessor().open(self.config["allow_filters"], "rb") as fl:
+            additional_filters_raw = fl.file.read().lower()
             additional_filters = json.loads(additional_filters_raw)
             self.allow_list_filters += additional_filters
 
@@ -1127,13 +1127,13 @@ class ImageMalfind(interfaces.plugins.PluginInterface):
                                 target_data = last_target.target_bytes
                                 if target_data is None:
                                     target_data = b''
-                                target_dis = interfaces.renderers.Disassembly(
+                                target_dis = renderers.Disassembly(
                                     target_data, last_target.target_vaddr, ptenum.arch_proc)
                             else:
                                 target_desc += "could not be resolved."
 
                         if target_dis is None:
-                            target_dis = interfaces.renderers.Disassembly(b'', 0, ptenum.arch_proc)
+                            target_dis = renderers.Disassembly(b'', 0, ptenum.arch_proc)
 
                         if target_data is None:
                             target_data = b''
@@ -1169,10 +1169,10 @@ class ImageMalfind(interfaces.plugins.PluginInterface):
                         if not data_orig:
                             data_orig = b''
 
-                        disas_orig = interfaces.renderers.Disassembly(
+                        disas_orig = renderers.Disassembly(
                             data_orig, analysis_state.first_analysis_vaddr, ptenum.arch_proc)
 
-                        disas_new = interfaces.renderers.Disassembly(
+                        disas_new = renderers.Disassembly(
                             data_new,
                             analysis_state.first_analysis_vaddr,
                             ptenum.arch_proc)

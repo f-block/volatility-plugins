@@ -70,7 +70,7 @@ class SimplePteEnumerator(interfaces.plugins.PluginInterface, ptenum.PteEnumerat
         return [*kernel_reqs,
                 requirements.PluginRequirement(name = 'pslist',
                                                plugin = pslist.PsList,
-                                               version = (2, 0, 0)),
+                                               version = (3, 0, 0)),
                 requirements.ListRequirement(name = 'pid',
                                             element_type = int,
                                             description = "Process ID to include (all other processes are excluded)",
@@ -126,8 +126,7 @@ class SimplePteEnumerator(interfaces.plugins.PluginInterface, ptenum.PteEnumerat
                                   self._generator(
                                       pslist.PsList.list_processes(
                                           self.context,
-                                          layer_name = layer_name,
-                                          symbol_table = symbol_table,
+                                          kernel_module_name=self.config["kernel"],
                                           filter_func = filter_func)))
 
 

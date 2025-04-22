@@ -1629,8 +1629,7 @@ class PteEnumerator(object):
         procs = list(
             pslist.PsList.list_processes(
                 self.context,
-                layer_name = self.kernel.layer_name,
-                symbol_table = self.kernel.symbol_table_name,
+                kernel_module_name=self.config["kernel"],
                 filter_func = filter_func))
         if len(procs) > 0:
             return procs[0]
@@ -2252,8 +2251,7 @@ class PteEnumerator(object):
             raise RuntimeError(err_msg)
 
         vers = info.Info.get_version_structure(self.context,
-                                               self.kernel.layer_name,
-                                               self.kernel.symbol_table_name)
+                                               kernel_module_name=self.config["kernel"])
         self._kernel_build = int(vers.MinorVersion)
 
         # Used for pretty-printing MMPTE structs
